@@ -5,4 +5,7 @@ __pycache__/
 venv/
 credentials.json
 token.json
+token_google.json
+token_ms.json
+Programs/sync/*.json
 Programs/logs/*.log
