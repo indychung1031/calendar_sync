@@ -1,0 +1,11 @@
+---
+description: Always read claude.md before any task
+alwaysApply: true
+---
+
+# Mandatory Project Context
+
+- Before answering, planning, editing, or running commands, read `c:\Users\indyc\Desktop\antigravity\project\calendar_sync\claude.md`.
+- Treat `claude.md` as the primary project rule source for folder usage and workflow constraints.
+- Any project rule addition, change, or removal must always be applied by editing `claude.md`. Never treat chat, `.cursor/rules/`, or other files as the canonical rule store unless the user explicitly requests otherwise.
+- If user instructions conflict with `claude.md`, ask for clarification before proceeding.
