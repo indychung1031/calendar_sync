@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+credentials.json
+token.json
+Programs/logs/*.log
