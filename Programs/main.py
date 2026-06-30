@@ -2,9 +2,10 @@
 Outlook ↔ Google 캘린더 양방향 동기화 진입점.
 
 사용법:
-  python main.py              # 일반 동기화 (최초 또는 증분)
-  python main.py --reauth     # Microsoft 재인증 후 동기화
-  python main.py --rebuild-map  # event_map 재구성 (중복 발생 시 복구용)
+  python main.py                 # 일반 동기화 (최초 또는 증분)
+  python main.py --reauth        # Microsoft 재인증 후 동기화
+  python main.py --rebuild-map   # event_map 재구성 (중복 발생 시 복구용)
+  python main.py --list-calendars  # Google 캘린더 목록과 ID 출력
 """
 
 import argparse
@@ -50,6 +51,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         dest="rebuild_map",
         help="event_map을 재구성 (중복 이벤트 발생 후 복구용)",
+    )
+    parser.add_argument(
+        "--list-calendars",
+        action="store_true",
+        dest="list_calendars",
+        help="Google 캘린더 목록과 ID를 출력 (GOOGLE_CALENDAR_ID 설정 참고용)",
     )
     return parser.parse_args()
 
@@ -121,6 +128,16 @@ def _run(args: argparse.Namespace, logger: logging.Logger) -> None:
     engine = SyncEngine(google_client, ms_client, event_map, last_sync)
 
     # ── 실행 ──────────────────────────────────────────────────────────────
+    if args.list_calendars:
+        calendars = google_client.list_calendars()
+        print("\n=== Google 캘린더 목록 ===")
+        for cal in calendars:
+            print(f"  이름: {cal.get('summary', '')}")
+            print(f"  ID:   {cal.get('id', '')}")
+            print()
+        print("→ .env 파일의 GOOGLE_CALENDAR_ID에 원하는 ID를 입력하세요.")
+        return
+
     if args.rebuild_map:
         logger.info("--rebuild-map 모드: event_map 재구성")
         try:

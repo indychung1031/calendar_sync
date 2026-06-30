@@ -90,6 +90,15 @@ class GoogleCalendarClient:
             logger.error("Google 이벤트 수정 실패 (id=%s): %s", event_id, e)
             raise
 
+    def list_calendars(self) -> list[dict]:
+        """사용자 Google 캘린더 목록 조회 (--list-calendars 용)."""
+        try:
+            result = self._service.calendarList().list().execute()
+            return result.get("items", [])
+        except HttpError as e:
+            logger.error("Google 캘린더 목록 조회 실패: %s", e)
+            raise
+
     def delete_event(self, event_id: str) -> None:
         try:
             self._service.events().delete(

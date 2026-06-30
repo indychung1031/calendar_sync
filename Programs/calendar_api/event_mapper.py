@@ -9,6 +9,23 @@ import re
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+# Google colorId → Outlook GSync 카테고리 이름 (event_mapper ↔ ms_calendar 공통 기준)
+GOOGLE_COLOR_TO_GSYNC: dict[str, str] = {
+    "1": "GSync-Lavender",
+    "2": "GSync-Sage",
+    "3": "GSync-Grape",
+    "4": "GSync-Flamingo",
+    "5": "GSync-Banana",
+    "6": "GSync-Tangerine",
+    "7": "GSync-Peacock",
+    "8": "GSync-Blueberry",
+    "9": "GSync-Basil",
+    "10": "GSync-Tomato",
+    "11": "GSync-Cobalt",
+}
+# 역변환: Outlook GSync 카테고리 이름 → Google colorId
+GSYNC_TO_GOOGLE_COLOR: dict[str, str] = {v: k for k, v in GOOGLE_COLOR_TO_GSYNC.items()}
+
 # MS Graph가 반환하는 Windows 타임존 이름을 IANA 이름으로 변환
 _WINDOWS_TO_IANA: dict[str, str] = {
     "Korea Standard Time": "Asia/Seoul",
@@ -128,6 +145,11 @@ def google_event_to_outlook(event: dict) -> dict:
     if location:
         body["location"] = {"displayName": location}
 
+    # 색상: Google colorId → GSync 카테고리 이름
+    color_id = event.get("colorId", "")
+    if color_id and color_id in GOOGLE_COLOR_TO_GSYNC:
+        body["categories"] = [GOOGLE_COLOR_TO_GSYNC[color_id]]
+
     return body
 
 
@@ -156,5 +178,11 @@ def outlook_event_to_google(event: dict) -> dict:
     display_name = event.get("location", {}).get("displayName", "")
     if display_name:
         body["location"] = display_name
+
+    # 색상: GSync 카테고리 이름 → Google colorId (첫 번째 매칭만 사용)
+    for cat in event.get("categories", []):
+        if cat in GSYNC_TO_GOOGLE_COLOR:
+            body["colorId"] = GSYNC_TO_GOOGLE_COLOR[cat]
+            break
 
     return body

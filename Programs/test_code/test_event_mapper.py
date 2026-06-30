@@ -12,6 +12,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from calendar_api.event_mapper import (
+    GOOGLE_COLOR_TO_GSYNC,
+    GSYNC_TO_GOOGLE_COLOR,
     google_event_to_outlook,
     is_google_deleted,
     is_outlook_deleted,
@@ -214,6 +216,83 @@ class TestOutlookToGoogle:
         }
         result = outlook_event_to_google(event)
         assert "description" not in result
+
+
+# ── 색상 동기화 ──────────────────────────────────────────────────────────
+
+class TestColorSync:
+    def _base_google_event(self, color_id: str | None = None) -> dict:
+        event = {
+            "summary": "색상 테스트",
+            "start": {"dateTime": "2025-06-29T09:00:00Z"},
+            "end": {"dateTime": "2025-06-29T10:00:00Z"},
+        }
+        if color_id:
+            event["colorId"] = color_id
+        return event
+
+    def _base_outlook_event(self, categories: list[str] | None = None) -> dict:
+        event = {
+            "subject": "색상 테스트",
+            "isAllDay": False,
+            "start": {"dateTime": "2025-06-29T09:00:00.0000000", "timeZone": "UTC"},
+            "end": {"dateTime": "2025-06-29T10:00:00.0000000", "timeZone": "UTC"},
+        }
+        if categories is not None:
+            event["categories"] = categories
+        return event
+
+    def test_google_tomato_maps_to_gsync_tomato(self):
+        result = google_event_to_outlook(self._base_google_event(color_id="10"))
+        assert result.get("categories") == ["GSync-Tomato"]
+
+    def test_google_peacock_maps_to_gsync_peacock(self):
+        result = google_event_to_outlook(self._base_google_event(color_id="7"))
+        assert result.get("categories") == ["GSync-Peacock"]
+
+    def test_google_no_color_has_no_categories(self):
+        result = google_event_to_outlook(self._base_google_event())
+        assert "categories" not in result
+
+    def test_outlook_gsync_tomato_maps_to_colorid_10(self):
+        result = outlook_event_to_google(self._base_outlook_event(["GSync-Tomato"]))
+        assert result.get("colorId") == "10"
+
+    def test_outlook_first_gsync_category_wins(self):
+        """GSync 카테고리가 여러 개여도 첫 번째만 사용."""
+        result = outlook_event_to_google(
+            self._base_outlook_event(["GSync-Tomato", "GSync-Peacock"])
+        )
+        assert result.get("colorId") == "10"
+
+    def test_outlook_non_gsync_category_ignored(self):
+        """사용자 기존 카테고리는 colorId에 영향 없음."""
+        result = outlook_event_to_google(self._base_outlook_event(["업무", "중요"]))
+        assert "colorId" not in result
+
+    def test_outlook_mixed_categories_picks_gsync(self):
+        """사용자 카테고리와 GSync 카테고리 혼합 시 GSync 우선."""
+        result = outlook_event_to_google(
+            self._base_outlook_event(["업무", "GSync-Sage"])
+        )
+        assert result.get("colorId") == "2"
+
+    def test_all_11_google_colors_have_mapping(self):
+        """Google 11가지 colorId 전부 매핑 테이블에 존재."""
+        for i in range(1, 12):
+            assert str(i) in GOOGLE_COLOR_TO_GSYNC
+
+    def test_reverse_mapping_covers_all(self):
+        """역변환 테이블이 정방향과 동일한 수의 항목 보유."""
+        assert len(GSYNC_TO_GOOGLE_COLOR) == len(GOOGLE_COLOR_TO_GSYNC)
+
+    def test_round_trip_color(self):
+        """Google colorId → Outlook category → Google colorId 왕복 일관성."""
+        for color_id in GOOGLE_COLOR_TO_GSYNC:
+            g_event = self._base_google_event(color_id=color_id)
+            outlook_body = google_event_to_outlook(g_event)
+            google_body = outlook_event_to_google({**self._base_outlook_event(), **outlook_body})
+            assert google_body.get("colorId") == color_id, f"colorId={color_id} 왕복 실패"
 
 
 # ── 왕복 변환 일관성 ──────────────────────────────────────────────────────

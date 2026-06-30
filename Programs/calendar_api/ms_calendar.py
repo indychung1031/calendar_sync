@@ -10,8 +10,24 @@ logger = logging.getLogger(__name__)
 
 _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 _SELECT_FIELDS = (
-    "id,subject,start,end,body,location,isAllDay,lastModifiedDateTime"
+    "id,subject,start,end,body,location,isAllDay,lastModifiedDateTime,categories"
 )
+
+# GSync 카테고리 이름 → Outlook 색상 프리셋 (Google colorId와 1:1 대응)
+# 접두어 'GSync-'로 사용자 기존 카테고리와 충돌 방지
+GSYNC_CATEGORIES: dict[str, str] = {
+    "GSync-Lavender": "preset8",    # Purple  ← Google 1
+    "GSync-Sage": "preset4",        # Green   ← Google 2
+    "GSync-Grape": "preset22",      # DarkPurple ← Google 3
+    "GSync-Flamingo": "preset9",    # Cranberry  ← Google 4
+    "GSync-Banana": "preset3",      # Yellow  ← Google 5
+    "GSync-Tangerine": "preset2",   # Orange  ← Google 6
+    "GSync-Peacock": "preset5",     # Teal    ← Google 7
+    "GSync-Blueberry": "preset21",  # DarkBlue ← Google 8
+    "GSync-Basil": "preset18",      # DarkGreen ← Google 9
+    "GSync-Tomato": "preset1",      # Red     ← Google 10
+    "GSync-Cobalt": "preset7",      # Blue    ← Google 11
+}
 # MS Graph 응답 시각을 UTC로 받도록 요청
 _PREFER_UTC = 'outlook.timezone="UTC"'
 _MAX_RETRIES = 3
@@ -107,6 +123,44 @@ class MSCalendarClient:
             logger.debug("MS 이벤트 이미 삭제됨 (id=%s)", event_id)
             return
         resp.raise_for_status()
+
+    # ── 카테고리 관리 ────────────────────────────────────────────────────────
+
+    def get_categories(self) -> list[dict]:
+        """사용자 Outlook 카테고리 목록 조회."""
+        resp = self._get(f"{_GRAPH_BASE}/me/outlook/masterCategories")
+        resp.raise_for_status()
+        return resp.json().get("value", [])
+
+    def ensure_gsync_categories(self) -> None:
+        """
+        GSync-* 색상 카테고리가 없으면 Outlook에 자동 생성.
+
+        동기화 시작 전 호출하여 색상 변환에 필요한 카테고리를 준비한다.
+        이미 존재하는 카테고리는 건너뜀 (멱등).
+        """
+        try:
+            existing = {c["displayName"] for c in self.get_categories()}
+        except Exception as e:
+            logger.warning("Outlook 카테고리 조회 실패 (색상 동기화 건너뜀): %s", e)
+            return
+
+        for name, preset in GSYNC_CATEGORIES.items():
+            if name in existing:
+                continue
+            resp = self._post(
+                f"{_GRAPH_BASE}/me/outlook/masterCategories",
+                json={"displayName": name, "color": preset},
+            )
+            if resp.status_code in (200, 201):
+                logger.info("Outlook 카테고리 생성: %s (%s)", name, preset)
+            else:
+                logger.warning(
+                    "Outlook 카테고리 생성 실패 (%s): %s %s",
+                    name,
+                    resp.status_code,
+                    resp.text[:200],
+                )
 
     # ── HTTP 헬퍼 (재시도 + 429 처리) ─────────────────────────────────────
 

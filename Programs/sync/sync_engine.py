@@ -39,6 +39,9 @@ class SyncEngine:
     # ── 진입점 ────────────────────────────────────────────────────────────
 
     def run(self) -> SyncStats:
+        # 색상 동기화에 필요한 GSync 카테고리를 Outlook에 사전 준비
+        self._ms.ensure_gsync_categories()
+
         if self._last_sync.is_initial():
             self._initial_sync()
         else:
