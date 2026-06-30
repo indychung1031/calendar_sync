@@ -2,9 +2,8 @@
 Outlook ↔ Google 캘린더 양방향 동기화 진입점.
 
 사용법:
-  python main.py                 # 일반 동기화 (최초 또는 증분)
-  python main.py --reauth        # Microsoft 재인증 후 동기화
-  python main.py --rebuild-map   # event_map 재구성 (중복 발생 시 복구용)
+  python main.py                   # 일반 동기화 (최초 또는 증분)
+  python main.py --rebuild-map     # event_map 재구성 (중복 발생 시 복구용)
   python main.py --list-calendars  # Google 캘린더 목록과 ID 출력
 """
 
@@ -17,9 +16,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from auth.google_auth import get_credentials
-from auth.ms_auth import MSAuthExpiredError, get_access_token
 from calendar_api.google_calendar import GoogleCalendarClient
-from calendar_api.ms_calendar import MSCalendarClient
+from calendar_api.ms_calendar import OutlookComClient
 from config import Config
 from sync.state import EventMap, LastSync, acquire_lock, release_lock
 from sync.sync_engine import SyncEngine
@@ -41,11 +39,6 @@ def setup_logging() -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Outlook ↔ Google 캘린더 동기화")
-    parser.add_argument(
-        "--reauth",
-        action="store_true",
-        help="Microsoft 인증 토큰을 초기화하고 재인증",
-    )
     parser.add_argument(
         "--rebuild-map",
         action="store_true",
@@ -98,28 +91,20 @@ def _run(args: argparse.Namespace, logger: logging.Logger) -> None:
         logger.critical("Google 인증 실패: %s", e)
         sys.exit(1)
 
-    # ── Microsoft 인증 ────────────────────────────────────────────────────
-    try:
-        ms_token = get_access_token(
-            cfg.ms_client_id,
-            cfg.ms_tenant_id,
-            cfg.ms_token_path,
-            force_reauth=args.reauth,
-        )
-    except MSAuthExpiredError:
-        # 메시지는 ms_auth.py에서 CRITICAL로 이미 기록됨
-        sys.exit(1)
-    except Exception as e:
-        logger.critical("Microsoft 인증 실패: %s", e)
-        sys.exit(1)
-
     # ── 클라이언트 초기화 ─────────────────────────────────────────────────
     google_client = GoogleCalendarClient(
         google_creds, cfg.google_calendar_id, cfg.sync_recurring_horizon_days
     )
-    ms_client = MSCalendarClient(
-        ms_token, cfg.ms_calendar_id, cfg.sync_recurring_horizon_days
-    )
+
+    try:
+        ms_client = OutlookComClient(
+            cfg.ms_calendar_id, cfg.sync_recurring_horizon_days
+        )
+    except Exception as e:
+        logger.critical(
+            "Outlook COM 연결 실패. Outlook이 설치되어 있는지 확인하세요: %s", e
+        )
+        sys.exit(1)
 
     # ── 상태 로드 ─────────────────────────────────────────────────────────
     event_map = EventMap.load()

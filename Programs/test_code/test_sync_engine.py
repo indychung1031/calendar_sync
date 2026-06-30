@@ -306,3 +306,51 @@ class TestIncrementalSync:
         engine.run()
         assert engine.stats.errors == 1
         assert engine.stats.added == 0
+
+
+# ── COM 전체 스캔 삭제 감지 ───────────────────────────────────────────────
+
+class TestOutlookComDeletion:
+    """Outlook COM 방식(전체 스캔)에서 삭제 이벤트 감지 테스트."""
+
+    def _setup_com_engine(self, tmp_path: Path):
+        engine, google, ms = _make_engine(tmp_path)
+        # COM 방식 표시 (delta 미지원)
+        ms.supports_delta = False
+        ms.list_events_delta.return_value = ([], "outlook_com_v1")
+        # 기존 매핑 등록
+        engine._map.set("g1", "o1", "2025-06-29T00:30:00Z", "2025-06-29T00:30:00Z")
+        engine._last_sync.last_sync_at = "2025-06-29T00:30:00Z"
+        engine._last_sync.google_updated_min = "2025-06-29T00:30:00Z"
+        engine._last_sync.ms_delta_link = "outlook_com_v1"
+        return engine, google, ms
+
+    def test_detect_outlook_deletion_and_remove_from_google(self, tmp_path):
+        """Outlook 이벤트가 사라지면 Google에서도 삭제 + event_map 제거."""
+        engine, google, ms = self._setup_com_engine(tmp_path)
+
+        # Outlook 전체 스캔 결과에 o1이 없음 → 삭제된 것
+        ms.list_events_delta.return_value = ([], "outlook_com_v1")
+        google.list_events.return_value = []
+
+        engine.run()
+
+        google.delete_event.assert_called_once_with("g1")
+        assert engine._map.get("g1") is None
+        assert engine.stats.deleted == 1
+
+    def test_no_false_deletion_when_event_exists(self, tmp_path):
+        """Outlook에 이벤트가 있으면 삭제하지 않음."""
+        engine, google, ms = self._setup_com_engine(tmp_path)
+
+        # o1이 현재 목록에 존재 → 삭제 없음
+        ms.list_events_delta.return_value = (
+            [_ms_event("o1", last_modified="2025-06-29T00:30:00Z")],
+            "outlook_com_v1",
+        )
+        google.list_events.return_value = []
+
+        engine.run()
+
+        google.delete_event.assert_not_called()
+        assert engine._map.get("g1") is not None

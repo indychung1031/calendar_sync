@@ -22,10 +22,7 @@ class Config:
     google_token_path: Path
     google_calendar_id: str
 
-    ms_client_id: str
-    ms_tenant_id: str
-    ms_token_path: Path
-    ms_calendar_id: str
+    ms_calendar_id: str  # 빈 문자열 = Outlook 기본 캘린더
 
     sync_recurring_horizon_days: int
 
@@ -35,9 +32,6 @@ class Config:
             google_credentials_path=_PROJECT_ROOT / _req("GOOGLE_CREDENTIALS_PATH"),
             google_token_path=_PROJECT_ROOT / _req("GOOGLE_TOKEN_PATH"),
             google_calendar_id=os.getenv("GOOGLE_CALENDAR_ID", "primary"),
-            ms_client_id=_req("MS_CLIENT_ID"),
-            ms_tenant_id=os.getenv("MS_TENANT_ID", "common"),
-            ms_token_path=_PROJECT_ROOT / _req("MS_TOKEN_PATH"),
             ms_calendar_id=os.getenv("MS_CALENDAR_ID", "").strip(),
             sync_recurring_horizon_days=int(
                 os.getenv("SYNC_RECURRING_HORIZON_DAYS", "365")

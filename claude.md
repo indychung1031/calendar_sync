@@ -16,9 +16,9 @@
 - **언어**: Python 3.12+
 - **주요 라이브러리**:
   - Google Calendar: `google-api-python-client`, `google-auth-oauthlib`
-  - Microsoft Outlook: `msal` (MS Graph API)
-  - 환경 변수: `python-dotenv`
-- **실행 환경**: 로컬 PC, Windows Task Scheduler (30분 주기 자동 실행)
+  - Microsoft Outlook: `pywin32` (로컬 Outlook COM — MS Graph/MSAL 미사용)
+  - 환경 변수: `python-dotenv`, `tzdata`
+- **실행 환경**: Windows PC + Outlook 데스크톱 앱, Windows Task Scheduler (30분 주기)
 - 스택 변경이 필요하면 기획서와 이 파일을 함께 갱신한다.
 
 ## 개발 워크플로우
@@ -56,7 +56,7 @@
 
 - 비밀 값은 `.env`에만 저장한다. `.env`는 커밋하지 않는다.
 - 필요한 키 목록은 `.env.example`에 값 없이 문서화한다.
-- OAuth 토큰, `credentials.json`, `token_google.json`, `token_ms.json` 등 인증 파일은 커밋하지 않는다.
+- OAuth 토큰, `credentials.json`, `token_google.json` 등 인증 파일은 커밋하지 않는다.
 - 동기화 상태·이벤트 매핑 파일(`Programs/sync/*.json`)은 커밋하지 않는다.
 - `.gitignore`에 위 파일들이 포함되어 있는지 확인한다.
 
@@ -69,13 +69,23 @@
 - **삭제 처리**: 한쪽에서 삭제 시 반대쪽도 삭제
 - **반복 일정**: 개별 인스턴스로 분해하여 처리 (오늘부터 최대 365일까지, `SYNC_RECURRING_HORIZON_DAYS`)
 - **실행 주기**: 30분마다 자동 실행
+- **색상 동기화**: Google `colorId` ↔ Outlook `GSync-*` 카테고리 (Outlook에서 범주 색상은 수동 지정)
 - **삭제 처리 주의**: 실수 삭제가 반대편에도 전파됨 — 위험 수용 정책 (기획서 §4-4)
-- 상세 구현(이벤트 매핑, 최초 동기화, API 제한)은 `Docs/01_Outlook_Google_캘린더_동기화_기획.md` 참조
+- 상세 구현은 `Docs/01_Outlook_Google_캘린더_동기화_기획.md` 참조
+
+## CLI
+
+```bash
+cd Programs
+python main.py                   # 동기화 실행
+python main.py --list-calendars  # Google 캘린더 ID 목록
+python main.py --rebuild-map     # event_map 재구성 (중복 복구)
+```
 
 ## 로그·에러 처리
 
 - 로그 파일은 `Programs/logs/` 하위에 저장한다.
-- API 호출 실패 시 재시도 횟수와 대기 시간을 코드에 명시한다. (MS Graph: 지수 백오프)
+- API 호출 실패 시 재시도 횟수와 대기 시간을 코드에 명시한다. (Google API HTTP 에러)
 - 동기화 실패 시 로그에 원인(캘린더 ID, 이벤트 ID, HTTP 상태 등)을 남긴다.
 - 로컬 상태 파일: `Programs/sync/last_sync.json`, `Programs/sync/event_map.json`
 

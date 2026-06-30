@@ -1,201 +1,241 @@
-"""MS Graph Calendar API 래퍼 (calendarView/delta 방식)."""
+"""Outlook 로컬 캘린더 래퍼 (win32com COM 방식).
+
+MS Graph API 대신 로컬에 설치된 Outlook 앱을 직접 제어한다.
+POP/SMTP, IMAP, Exchange 등 모든 Outlook 계정 유형에서 동작하며
+별도 Azure 앱 등록이나 인증 절차가 필요 없다.
+"""
 
 import logging
-import time
+import re
 from datetime import datetime, timedelta, timezone
 
-import requests
+import pythoncom
+import win32com.client
 
 logger = logging.getLogger(__name__)
 
-_GRAPH_BASE = "https://graph.microsoft.com/v1.0"
-_SELECT_FIELDS = (
-    "id,subject,start,end,body,location,isAllDay,lastModifiedDateTime,categories"
-)
+_OL_FOLDER_CALENDAR = 9    # olFolderCalendar
+_OL_APPOINTMENT_ITEM = 1   # olAppointmentItem (CreateItem 용)
+_OL_APPOINTMENT_CLASS = 26 # olAppointment (item.Class 비교 용)
 
-# GSync 카테고리 이름 → Outlook 색상 프리셋 (Google colorId와 1:1 대응)
-# 접두어 'GSync-'로 사용자 기존 카테고리와 충돌 방지
-GSYNC_CATEGORIES: dict[str, str] = {
-    "GSync-Lavender": "preset8",    # Purple  ← Google 1
-    "GSync-Sage": "preset4",        # Green   ← Google 2
-    "GSync-Grape": "preset22",      # DarkPurple ← Google 3
-    "GSync-Flamingo": "preset9",    # Cranberry  ← Google 4
-    "GSync-Banana": "preset3",      # Yellow  ← Google 5
-    "GSync-Tangerine": "preset2",   # Orange  ← Google 6
-    "GSync-Peacock": "preset5",     # Teal    ← Google 7
-    "GSync-Blueberry": "preset21",  # DarkBlue ← Google 8
-    "GSync-Basil": "preset18",      # DarkGreen ← Google 9
-    "GSync-Tomato": "preset1",      # Red     ← Google 10
-    "GSync-Cobalt": "preset7",      # Blue    ← Google 11
-}
-# MS Graph 응답 시각을 UTC로 받도록 요청
-_PREFER_UTC = 'outlook.timezone="UTC"'
-_MAX_RETRIES = 3
+_HAS_TZ = re.compile(r"[Zz]|[+-]\d{2}:\d{2}$")
 
 
-class MSCalendarClient:
-    def __init__(
-        self,
-        access_token: str,
-        calendar_id: str,
-        horizon_days: int,
-    ):
-        self._headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-            "Prefer": _PREFER_UTC,
-        }
-        self._cal_id = calendar_id  # 비어 있으면 기본 캘린더 사용
+def _pywint_to_utc(dt) -> str:
+    """pywintypes.datetime(로컬 시각) → UTC ISO 문자열 ('YYYY-MM-DDTHH:MM:SSZ')."""
+    naive = datetime(dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second)
+    utc = naive.astimezone().astimezone(timezone.utc)
+    return utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _to_com_local(dt_str: str, tz_name: str = "UTC") -> str:
+    """datetime 문자열 → Outlook COM 설정용 로컬 시각 문자열 ('YYYY-MM-DD HH:MM:SS').
+
+    타임존 정보가 없으면 tz_name을 UTC로 처리한다.
+    """
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    clean = re.sub(r"\.\d+", "", dt_str)
+    if not _HAS_TZ.search(clean):
+        try:
+            tz = ZoneInfo(tz_name)
+        except (ZoneInfoNotFoundError, KeyError):
+            tz = timezone.utc
+        dt = datetime.fromisoformat(clean).replace(tzinfo=tz)
+    else:
+        clean = clean.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(clean)
+    return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+class OutlookComClient:
+    """Outlook COM 인터페이스를 통해 로컬 캘린더를 읽고 쓴다.
+
+    delta query를 지원하지 않으므로 항상 전체 스캔한다.
+    sync_engine은 supports_delta = False를 보고 삭제 감지 로직을 별도로 실행한다.
+    """
+
+    supports_delta: bool = False  # SyncEngine이 삭제 감지 방식 선택에 사용
+
+    def __init__(self, calendar_name: str = "", horizon_days: int = 365):
+        """
+        calendar_name: 빈 문자열이면 Outlook 기본 캘린더 사용.
+                       폴더 이름 지정 시 해당 서브 폴더 사용.
+        """
+        pythoncom.CoInitialize()
+        self._app = win32com.client.Dispatch("Outlook.Application")
+        self._ns = self._app.GetNamespace("MAPI")
         self._horizon_days = horizon_days
+        self._calendar = self._get_calendar_folder(calendar_name)
+        logger.info(
+            "Outlook COM 연결 완료 (캘린더: %s)",
+            calendar_name or "기본 캘린더",
+        )
 
-    # ── URL 헬퍼 ──────────────────────────────────────────────────────────
+    def _get_calendar_folder(self, name: str):
+        default = self._ns.GetDefaultFolder(_OL_FOLDER_CALENDAR)
+        if not name:
+            return default
+        try:
+            return default.Folders[name]
+        except Exception:
+            logger.warning("캘린더 폴더 '%s' 없음 → 기본 캘린더 사용", name)
+            return default
 
-    def _cal_base(self) -> str:
-        if self._cal_id:
-            return f"{_GRAPH_BASE}/me/calendars/{self._cal_id}"
-        return f"{_GRAPH_BASE}/me/calendar"
+    # ── 이벤트 조회 (항상 전체 스캔) ─────────────────────────────────────────
 
-    def _view_delta_url(self) -> str:
-        return f"{self._cal_base()}/calendarView/delta"
+    def list_events(self) -> list[dict]:
+        """동기화 범위 내 모든 이벤트 반환 (오늘 ~ horizon_days 후).
 
-    def _events_url(self) -> str:
-        return f"{self._cal_base()}/events"
+        Restrict 필터는 로케일에 따라 동작이 달라지므로 Python에서 직접 필터링한다.
+        Start 기준 정렬 후 범위를 벗어나면 break하여 성능을 확보한다.
+        """
+        now = datetime.now()
+        end = now + timedelta(days=self._horizon_days)
 
-    # ── 이벤트 조회 ───────────────────────────────────────────────────────
+        items = self._calendar.Items
+        # IncludeRecurrences는 Sort 이전에 설정해야 반복 일정이 전개됨
+        items.IncludeRecurrences = True
+        items.Sort("[Start]")
+
+        # Restrict 필터로 날짜 범위 1차 축소 (MM/DD/YYYY 형식은 로케일 무관하게 동작)
+        start_str = now.strftime("%m/%d/%Y %H:%M")
+        end_str = end.strftime("%m/%d/%Y %H:%M")
+        filter_str = f"[Start] >= '{start_str}' AND [Start] < '{end_str}'"
+        try:
+            restricted = items.Restrict(filter_str)
+        except Exception:
+            restricted = items  # Restrict 실패 시 전체 컬렉션으로 폴백
+
+        events: list[dict] = []
+        for item in restricted:
+            try:
+                if item.Class != _OL_APPOINTMENT_CLASS:
+                    continue
+                # pywintypes.datetime은 naive datetime이므로 직접 비교 가능
+                s = item.Start
+                item_start = datetime(s.year, s.month, s.day, s.hour, s.minute, s.second)
+                if item_start < now:
+                    continue
+                if item_start >= end:
+                    break
+                events.append(self._item_to_dict(item))
+            except Exception as e:
+                logger.warning("Outlook 이벤트 변환 실패: %s", e)
+        return events
 
     def list_events_initial(self) -> tuple[list[dict], str]:
-        """
-        전체 초기 조회. (이벤트 목록, deltaLink) 반환.
-
-        calendarView/delta는 startDateTime·endDateTime 필수.
-        """
-        now = datetime.now(timezone.utc)
-        end = now + timedelta(days=self._horizon_days)
-        params = {
-            "startDateTime": now.isoformat(),
-            "endDateTime": end.isoformat(),
-            "$select": _SELECT_FIELDS,
-        }
-        return self._paginate_delta(self._view_delta_url(), params)
+        """최초 동기화용. (이벤트 목록, 더미 delta_link) 반환."""
+        return self.list_events(), "outlook_com_v1"
 
     def list_events_delta(self, delta_link: str) -> tuple[list[dict], str]:
-        """증분 조회. deltaLink URL 자체에 파라미터 포함됨."""
-        return self._paginate_delta(delta_link, {})
+        """증분 동기화용. COM은 delta가 없으므로 항상 전체 스캔."""
+        return self.list_events(), delta_link  # delta_link 값 유지 (COM 마커)
 
-    def _paginate_delta(
-        self, url: str, params: dict
-    ) -> tuple[list[dict], str]:
-        events: list[dict] = []
-        delta_link: str = ""
-        first_request = True
+    def _item_to_dict(self, item) -> dict:
+        """Outlook AppointmentItem → 표준 이벤트 dict 변환."""
+        is_all_day = bool(item.AllDayEvent)
 
-        while url:
-            resp = self._get(url, params=params if first_request else None)
-            resp.raise_for_status()
-            data = resp.json()
-            events.extend(data.get("value", []))
-            first_request = False
+        if is_all_day:
+            # 전일 일정: 로컬 날짜 그대로 사용 (UTC 변환 시 날짜 어긋남 방지)
+            s = item.Start
+            e = item.End
+            date_str = f"{s.year:04d}-{s.month:02d}-{s.day:02d}"
+            end_date = f"{e.year:04d}-{e.month:02d}-{e.day:02d}"
+            start_field = {"dateTime": f"{date_str}T00:00:00", "timeZone": "UTC"}
+            end_field = {"dateTime": f"{end_date}T00:00:00", "timeZone": "UTC"}
+        else:
+            start_field = {"dateTime": _pywint_to_utc(item.Start), "timeZone": "UTC"}
+            end_field = {"dateTime": _pywint_to_utc(item.End), "timeZone": "UTC"}
 
-            if "@odata.deltaLink" in data:
-                delta_link = data["@odata.deltaLink"]
-                break
-            url = data.get("@odata.nextLink", "")
+        categories = [
+            c.strip()
+            for c in (item.Categories or "").split(",")
+            if c.strip()
+        ]
 
-        return events, delta_link
+        return {
+            "id": item.EntryID,
+            "subject": item.Subject or "",
+            "isAllDay": is_all_day,
+            "start": start_field,
+            "end": end_field,
+            "body": {"contentType": "text", "content": item.Body or ""},
+            "location": {"displayName": item.Location or ""},
+            "lastModifiedDateTime": _pywint_to_utc(item.LastModificationTime),
+            "categories": categories,
+        }
 
-    # ── CRUD ──────────────────────────────────────────────────────────────
+    # ── CRUD ──────────────────────────────────────────────────────────────────
 
     def create_event(self, body: dict) -> dict:
-        resp = self._post(self._events_url(), json=body)
-        resp.raise_for_status()
-        return resp.json()
+        """새 Outlook 이벤트 생성 후 dict 반환."""
+        appt = self._app.CreateItem(_OL_APPOINTMENT_ITEM)
+        self._apply_body(appt, body)
+        appt.Save()
+        logger.debug("Outlook 이벤트 생성: %s", body.get("subject", ""))
+        return self._item_to_dict(appt)
 
-    def update_event(self, event_id: str, body: dict) -> dict:
-        url = f"{_GRAPH_BASE}/me/events/{event_id}"
-        resp = self._patch(url, json=body)
-        resp.raise_for_status()
-        return resp.json()
+    def update_event(self, entry_id: str, body: dict) -> dict:
+        """기존 Outlook 이벤트 수정 후 dict 반환."""
+        appt = self._ns.GetItemFromID(entry_id)
+        self._apply_body(appt, body)
+        appt.Save()
+        logger.debug("Outlook 이벤트 수정: %s", body.get("subject", ""))
+        return self._item_to_dict(appt)
 
-    def delete_event(self, event_id: str) -> None:
-        url = f"{_GRAPH_BASE}/me/events/{event_id}"
-        resp = self._delete(url)
-        if resp.status_code == 404:
-            logger.debug("MS 이벤트 이미 삭제됨 (id=%s)", event_id)
-            return
-        resp.raise_for_status()
+    def delete_event(self, entry_id: str) -> None:
+        """Outlook 이벤트 삭제 (이미 삭제된 경우 무시)."""
+        try:
+            appt = self._ns.GetItemFromID(entry_id)
+            appt.Delete()
+            logger.debug("Outlook 이벤트 삭제: %s", entry_id)
+        except Exception as e:
+            logger.debug("Outlook 이벤트 이미 삭제됨 (id=%s): %s", entry_id, e)
 
-    # ── 카테고리 관리 ────────────────────────────────────────────────────────
+    def _apply_body(self, appt, body: dict) -> None:
+        """body dict 내용을 AppointmentItem에 적용."""
+        appt.Subject = body.get("subject", "")
 
-    def get_categories(self) -> list[dict]:
-        """사용자 Outlook 카테고리 목록 조회."""
-        resp = self._get(f"{_GRAPH_BASE}/me/outlook/masterCategories")
-        resp.raise_for_status()
-        return resp.json().get("value", [])
+        is_all_day = body.get("isAllDay", False)
+        start = body.get("start", {})
+        end = body.get("end", {})
+
+        if is_all_day:
+            appt.AllDayEvent = True
+            # 전일 일정: 날짜 문자열만 설정 (시각 변환 불필요)
+            appt.Start = start.get("dateTime", "")[:10]
+            appt.End = end.get("dateTime", "")[:10]
+        else:
+            appt.AllDayEvent = False
+            start_tz = start.get("timeZone", "UTC")
+            end_tz = end.get("timeZone", "UTC")
+            appt.Start = _to_com_local(start.get("dateTime", ""), start_tz)
+            appt.End = _to_com_local(end.get("dateTime", ""), end_tz)
+
+        content = body.get("body", {}).get("content", "")
+        appt.Body = content or ""
+
+        location = body.get("location", {}).get("displayName", "")
+        appt.Location = location or ""
+
+        # GSync-* 이외 기존 카테고리 보존 + 신규 GSync-* 적용
+        existing_raw = appt.Categories or ""
+        existing_cats = [c.strip() for c in existing_raw.split(",") if c.strip()]
+        non_gsync = [c for c in existing_cats if not c.startswith("GSync-")]
+        new_gsync = body.get("categories", [])
+        all_cats = non_gsync + new_gsync
+        appt.Categories = ", ".join(all_cats)
+
+    # ── 카테고리 관리 ─────────────────────────────────────────────────────────
 
     def ensure_gsync_categories(self) -> None:
+        """COM 방식에서는 카테고리가 이벤트 저장 시 자동 생성된다.
+
+        색상 지정은 Outlook에서 수동으로 설정해야 한다:
+        홈 탭 → 범주 → 모든 범주 → GSync-* 항목에 색상 지정.
         """
-        GSync-* 색상 카테고리가 없으면 Outlook에 자동 생성.
-
-        동기화 시작 전 호출하여 색상 변환에 필요한 카테고리를 준비한다.
-        이미 존재하는 카테고리는 건너뜀 (멱등).
-        """
-        try:
-            existing = {c["displayName"] for c in self.get_categories()}
-        except Exception as e:
-            logger.warning("Outlook 카테고리 조회 실패 (색상 동기화 건너뜀): %s", e)
-            return
-
-        for name, preset in GSYNC_CATEGORIES.items():
-            if name in existing:
-                continue
-            resp = self._post(
-                f"{_GRAPH_BASE}/me/outlook/masterCategories",
-                json={"displayName": name, "color": preset},
-            )
-            if resp.status_code in (200, 201):
-                logger.info("Outlook 카테고리 생성: %s (%s)", name, preset)
-            else:
-                logger.warning(
-                    "Outlook 카테고리 생성 실패 (%s): %s %s",
-                    name,
-                    resp.status_code,
-                    resp.text[:200],
-                )
-
-    # ── HTTP 헬퍼 (재시도 + 429 처리) ─────────────────────────────────────
-
-    def _get(self, url: str, **kwargs) -> requests.Response:
-        return self._request("GET", url, **kwargs)
-
-    def _post(self, url: str, **kwargs) -> requests.Response:
-        return self._request("POST", url, **kwargs)
-
-    def _patch(self, url: str, **kwargs) -> requests.Response:
-        return self._request("PATCH", url, **kwargs)
-
-    def _delete(self, url: str, **kwargs) -> requests.Response:
-        return self._request("DELETE", url, **kwargs)
-
-    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
-        for attempt in range(_MAX_RETRIES):
-            resp = requests.request(
-                method, url, headers=self._headers, **kwargs
-            )
-
-            if resp.status_code == 429:
-                # Rate limit: Retry-After 헤더 우선, 없으면 지수 백오프
-                wait = int(resp.headers.get("Retry-After", 2 ** attempt))
-                logger.warning("MS Graph rate limit. %d초 대기 후 재시도", wait)
-                time.sleep(wait)
-                continue
-
-            if resp.status_code == 503:
-                wait = 2 ** attempt
-                logger.warning("MS Graph 503. %d초 대기 후 재시도", wait)
-                time.sleep(wait)
-                continue
-
-            return resp
-
-        logger.error("MS Graph 요청 최대 재시도 초과: %s %s", method, url)
-        return resp  # 마지막 응답 반환 (호출 측에서 raise_for_status)
+        logger.info(
+            "Outlook COM 방식: GSync-* 카테고리는 동기화 시 자동 생성됩니다. "
+            "색상은 Outlook '모든 범주'에서 수동 지정하세요."
+        )

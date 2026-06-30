@@ -1,5 +1,8 @@
 # 01. Outlook ↔ Google 캘린더 양방향 동기화 기획서
 
+> **상태**: ✅ 구현·실행 완료 (2026-06-30)  
+> **아키텍처 변경**: Outlook 연동을 MS Graph API → **로컬 Outlook COM(pywin32)** 으로 전환 (Azure 앱 등록 불필요)
+
 ## 1. 프로젝트 개요
 
 Microsoft Outlook 캘린더와 Google 캘린더 간의 양방향 동기화 프로그램.  
@@ -22,10 +25,20 @@ Microsoft Outlook 캘린더와 Google 캘린더 간의 양방향 동기화 프�
 |---|---|
 | 언어 | Python 3.12+ |
 | Google Calendar | `google-api-python-client`, `google-auth-oauthlib` |
-| Microsoft Outlook | `msal` (Microsoft Authentication Library) + MS Graph API (REST) |
+| Microsoft Outlook | **`pywin32` COM** (로컬 Outlook 앱 직접 제어) |
 | 스케줄러 | Windows Task Scheduler |
-| 환경 변수 | `python-dotenv` |
+| 환경 변수 | `python-dotenv`, `tzdata` |
 | 로깅 | Python 표준 `logging` 모듈 |
+
+### 아키텍처 결정: Outlook COM 방식
+
+| | MS Graph (기존 기획) | Outlook COM (최종 구현) |
+|---|---|---|
+| Azure 앱 등록 | 필요 | **불필요** |
+| 인증 | MSAL device code flow | Outlook 앱이 처리 |
+| 계정 유형 | M365 위주 | POP/IMAP/Exchange 등 **모든 Outlook 계정** |
+| delta query | 지원 | 미지원 → 전체 스캔 + event_map 기반 삭제 감지 |
+| 색상 동기화 | 카테고리 API | GSync-* 카테고리 (색상은 Outlook에서 수동 지정) |
 
 ---
 
@@ -65,31 +78,30 @@ Microsoft Outlook 캘린더와 Google 캘린더 간의 양방향 동기화 프�
 ## 5. 주요 기능
 
 ### 5-1. 인증 관리
-- Google OAuth 2.0 인증 및 토큰 갱신 (`Installed App` flow, `token_google.json` 저장)
-- Microsoft OAuth 2.0 (MSAL) 인증 및 토큰 갱신
-  - **로컬 PC 단독 실행**: Azure 앱을 **Public client**로 등록, **device code flow** 사용 (client secret 불필요)
-  - `MS_TENANT_ID=common` (개인 Microsoft 계정) 또는 조직 tenant ID
-- 토큰 만료 시 자동 갱신 (MSAL token cache 사용)
-- **⚠️ MSAL Refresh Token 만료 처리**: Microsoft refresh token은 90일 미사용 시 만료됨
-  - 만료 감지 시 로그 레벨 `CRITICAL`로 기록하고 프로세스 종료
-  - 재인증은 수동으로 진행 (`python main.py --reauth`)
+- **Google**: OAuth 2.0 Installed App flow (`credentials.json` → `token_google.json`)
+- **Outlook**: 별도 인증 없음 — 로컬 Outlook 앱 COM 연결 (`Outlook.Application`)
+  - Outlook이 실행 중이거나 백그라운드로 동작해야 함
+  - `auth/ms_auth.py`는 COM 전환 이후 **미사용** (deprecated 주석만 유지)
+- Google 토큰 만료 시 `google-auth`가 자동 refresh
 
 ### 5-2. 이벤트 읽기
-- **Google**: bounded-window 방식 사용
-  - `syncToken`은 `timeMin`/`timeMax`와 동시 사용 불가 → 미사용
-  - 최초 실행: `timeMin=오늘`, `timeMax=오늘+HORIZON`, `singleEvents=True`, `showDeleted=False`
-  - 증분 실행: 위 파라미터 + `updatedMin=마지막동기화시각`, `showDeleted=True`
-  - 삭제된 이벤트: `status: cancelled`로 반환됨
-- **MS Graph**: `delta query` 방식 사용
-  - `calendarView/delta`는 `startDateTime`, `endDateTime` 모두 필수
-  - 최초 실행: `/me/calendarView/delta?startDateTime=오늘&endDateTime=오늘+HORIZON` 전체 조회 후 `@odata.deltaLink` 저장
-  - 증분 실행: `deltaLink`로 변경 사항만 조회
-  - `deltaLink` 만료 시: 전체 재조회 후 링크 갱신
-- `google_updated_min`, `ms_delta_link`는 `last_sync.json`에 저장
+- **Google** (`calendar_api/google_calendar.py`): bounded-window + `updatedMin` 증분
+  - `timeMin=오늘`, `timeMax=오늘+HORIZON`, `singleEvents=True`
+  - 증분: `updatedMin` + `showDeleted=True` (삭제는 `status: cancelled`)
+- **Outlook** (`calendar_api/ms_calendar.py`): COM 전체 스캔
+  - `IncludeRecurrences=True` + `Sort([Start])` + Restrict 날짜 필터
+  - delta 미지원 → `ms_delta_link`는 `"outlook_com_v1"` 마커만 저장
+  - 삭제 감지: `event_map`에 있으나 현재 스캔 목록에 없는 Outlook ID → Google에서 삭제
 
 ### 5-3. 이벤트 변환
-- Google 이벤트 형식 ↔ Outlook 이벤트 형식 간 변환
-- 매핑 필드: 제목, 시작/종료 시각, 설명, 장소, 전일 일정 여부
+- Google 이벤트 형식 ↔ Outlook 이벤트 형식 간 변환 (`event_mapper.py`)
+- 매핑 필드: 제목, 시작/종료 시각, 설명, 장소, 전일 일정 여부, **색상**
+
+#### 색상 동기화
+- Google `colorId` (11색) → Outlook `GSync-*` 카테고리 이름 (예: `GSync-Tomato`)
+- 역방향: Outlook 카테고리 중 `GSync-*` 첫 번째 매칭 → Google `colorId`
+- 사용자 기존 카테고리는 유지, GSync 카테고리만 추가/갱신
+- Outlook 범주 **색상**은 COM으로 자동 지정 불가 → Outlook UI에서 수동 설정
 
 #### 타임존 처리 정책
 - 모든 시각 비교·저장은 **UTC 기준으로 정규화**한다.
@@ -106,7 +118,7 @@ Microsoft Outlook 캘린더와 Google 캘린더 간의 양방향 동기화 프�
 
 | 파일 | 용도 |
 |---|---|
-| `last_sync.json` | 마지막 동기화 시각, Google syncToken, MS deltaLink, 처리 통계 |
+| `last_sync.json` | 마지막 동기화 시각, `google_updated_min`, `ms_delta_link`(COM 마커) |
 | `event_map.json` | Google ↔ Outlook ID 매핑 + 양쪽 마지막 수정 시각 |
 | `sync.lock` | 동시 실행 방지용 잠금 파일 (실행 중에만 존재) |
 
@@ -148,45 +160,57 @@ Microsoft Outlook 캘린더와 Google 캘린더 간의 양방향 동기화 프�
 4. 짝이 2개 이상 매칭되면 로그에 경고 남기고 수동 확인 대상으로 표시 (자동 병합 안 함)
 
 #### 증분 동기화 (2회차 이후)
-- `syncToken` / `deltaLink`로 변경된 이벤트만 조회
-- **무한 루프 방지**: 이벤트 수정 시각(API 반환값)이 `event_map.json`에 기록된 수정 시각과 동일하면 → 우리가 동기화한 결과물로 판단하여 **건너뜀**
-- 충돌 감지: 매핑된 양쪽 이벤트가 모두 기록된 수정 시각과 다를 경우 → last modified 우선으로 덮어쓰기
+- Google: `updatedMin`으로 변경 이벤트만 조회
+- Outlook: COM 전체 스캔 후 `event_map`과 비교
+- **Outlook 삭제 감지**: `_detect_and_apply_outlook_deletions()` — map에 있으나 스캔 목록에 없는 ID
+- **무한 루프 방지**: 서버 반환 수정 시각이 `event_map` 기록과 동일하면 건너뜀
+- 충돌: 양쪽 모두 변경 시 last modified 우선
 - **삭제 처리**:
-  1. API에서 삭제 확인된 이벤트를 반대쪽에도 삭제
-  2. `event_map.json`에서 해당 항목 **즉시 제거** (제거하지 않으면 다음 동기화에서 404 에러 루프 발생)
+  1. Google `cancelled` → Outlook 삭제
+  2. Outlook 목록에서 사라짐 → Google 삭제
+  3. `event_map`에서 해당 항목 즉시 제거
 
-### 5-5. 로깅
+### 5-5. CLI (`main.py`)
+
+| 명령 | 설명 |
+|---|---|
+| `python main.py` | 일반 동기화 (최초 또는 증분) |
+| `python main.py --list-calendars` | Google 캘린더 목록·ID 출력 |
+| `python main.py --rebuild-map` | event_map 재구성 (중복 복구) |
+
+### 5-6. 로깅
 - 동기화 시작/종료 시각 기록
 - 처리된 이벤트 수 (추가/수정/삭제) 기록
 - 에러 발생 시 원인(캘린더 ID, 이벤트 ID, HTTP 상태) 기록
 
 ---
 
-## 6. 디렉토리 구조 (예상)
+## 6. 디렉토리 구조 (구현 완료)
 
 ```
 Programs/
-├── main.py                  # 진입점
+├── main.py
 ├── requirements.txt
-├── config.py                # 설정값 로드
+├── config.py
 ├── auth/
-│   ├── google_auth.py       # Google OAuth 처리
-│   └── ms_auth.py           # Microsoft MSAL 처리
-├── calendar_api/            # 'calendar'는 Python stdlib 충돌로 사용 불가
-│   ├── google_calendar.py   # Google Calendar API 래퍼
-│   ├── ms_calendar.py       # MS Graph Calendar API 래퍼
-│   └── event_mapper.py      # 이벤트 형식 변환
+│   ├── google_auth.py       # Google OAuth
+│   └── ms_auth.py           # (deprecated) COM 전환 후 미사용
+├── calendar_api/
+│   ├── google_calendar.py
+│   ├── ms_calendar.py       # OutlookComClient
+│   └── event_mapper.py
 ├── sync/
-│   ├── sync_engine.py       # 동기화 핵심 로직
-│   ├── state.py             # 마지막 동기화 상태 관리
-│   ├── last_sync.json       # (런타임) 마지막 동기화 시각, syncToken, deltaLink
-│   ├── event_map.json       # (런타임) Google ↔ Outlook ID + 수정 시각 매핑
-│   ├── event_map.json.bak   # (런타임) event_map 자동 백업
-│   └── sync.lock            # (런타임) 동시 실행 방지 잠금 파일
-├── logs/                    # 로그 파일 저장
-└── test_code/               # 테스트 코드
-    ├── test_google_auth.py
-    ├── test_ms_auth.py
+│   ├── sync_engine.py
+│   ├── state.py
+│   ├── last_sync.json       # (런타임)
+│   ├── event_map.json       # (런타임)
+│   ├── event_map.json.bak   # (런타임)
+│   └── sync.lock            # (런타임)
+├── logs/
+│   └── sync.log
+└── test_code/
+    ├── test_event_mapper.py
+    ├── test_state.py
     └── test_sync_engine.py
 ```
 
@@ -202,11 +226,8 @@ GOOGLE_CREDENTIALS_PATH=credentials.json
 GOOGLE_TOKEN_PATH=token_google.json
 GOOGLE_CALENDAR_ID=primary
 
-# Microsoft Outlook
-MS_CLIENT_ID=
-MS_TENANT_ID=common
-MS_TOKEN_PATH=token_ms.json
-MS_CALENDAR_ID=
+# Microsoft Outlook (COM — Azure 앱 등록 불필요)
+MS_CALENDAR_ID=    # 비워두면 기본 캘린더
 
 # 동기화 설정
 SYNC_START_FROM_TODAY=true
@@ -219,65 +240,94 @@ SYNC_RECURRING_HORIZON_DAYS=365
 
 | API | 제한 | 대응 |
 |---|---|---|
-| Google Calendar | 1,000,000 req/day | 변경된 이벤트만 조회 |
-| MS Graph | 10,000 req/10min | 지수 백오프(exponential backoff) 재시도 |
+| Google Calendar | 1,000,000 req/day | `updatedMin` 증분 조회 |
+| Outlook COM | 로컬 제한 없음 | 전체 스캔 — 이벤트 수 많을 시 실행 시간 증가 |
 
 ---
 
 ## 9. 작업 체크리스트
 
 ### 인증
-- [x] Google OAuth 2.0 인증 구현 및 토큰 저장 (`auth/google_auth.py`)
-- [x] MS MSAL 인증 구현 및 토큰 저장 (`auth/ms_auth.py`, device code flow)
-- [x] 토큰 자동 갱신 처리 (Google refresh, MSAL silent 갱신)
+- [x] Google OAuth 2.0 인증 및 토큰 저장 (`auth/google_auth.py`)
+- [x] Outlook COM 연결 (`calendar_api/ms_calendar.py`) — 별도 MS 인증 불필요
+- [x] Google 토큰 자동 갱신
 
 ### 캘린더 읽기/쓰기
 - [x] Google Calendar 이벤트 조회 (bounded-window, updatedMin 증분)
 - [x] Google Calendar 이벤트 생성/수정/삭제
-- [x] MS Graph 이벤트 조회 (calendarView/delta)
-- [x] MS Graph 이벤트 생성/수정/삭제
+- [x] Outlook COM 이벤트 조회 (전체 스캔, 반복 일정 전개)
+- [x] Outlook COM 이벤트 생성/수정/삭제
 
 ### 이벤트 변환
 - [x] Google → Outlook 필드 매핑 구현
 - [x] Outlook → Google 필드 매핑 구현
 - [x] 일반 일정: UTC 정규화 후 변환
-- [x] 전일 일정(all-day): 날짜 문자열만 사용 (UTC 변환 없이)
+- [x] 전일 일정(all-day): 날짜 문자열만 사용
+- [x] 색상 동기화: Google colorId ↔ GSync-* 카테고리 (11색 매핑)
 
 ### 동기화 엔진
-- [x] `event_map.json` 저장/로드 (Google ↔ Outlook ID + 수정 시각 매핑)
-- [x] `event_map.json` 변경 시 `.bak` 백업 처리
-- [x] `last_sync.json` 저장/로드 (google_updated_min, ms_delta_link 포함)
-- [x] `sync.lock` 기반 동시 실행 방지 (2시간 경과 stale lock 자동 해제)
+- [x] `event_map.json` 저장/로드 + `.bak` 백업
+- [x] `last_sync.json` 저장/로드
+- [x] `sync.lock` 동시 실행 방지 (2시간 stale lock 해제)
 - [x] 최초 동기화: 제목 + UTC 시각 기반 자동 짝짓기
-- [x] Google bounded-window + updatedMin 증분 조회
-- [x] MS Graph deltaLink 기반 변경 감지 (최초/만료 시 전체 재조회)
-- [x] 무한 루프 방지: 서버 반환 수정 시각 비교로 자체 동기화 결과물 건너뜀
+- [x] Google `updatedMin` 증분 조회
+- [x] Outlook COM 전체 스캔 + event_map 기반 삭제 감지
+- [x] 무한 루프 방지 (수정 시각 비교)
 - [x] 충돌 감지 및 last modified 우선 처리
 - [x] 삭제 전파 후 event_map 항목 즉시 제거
-- [x] `--reauth` 플래그: MS 재인증 수동 실행
-- [x] `--rebuild-map` 플래그: event_map 재구성
+- [x] `--rebuild-map` 플래그
+- [x] `--list-calendars` 플래그
 
 ### 로그·에러 처리
-- [x] 로그 파일 설정 (Programs/logs/)
-- [x] API 에러 재시도 로직 (MS Graph 429/503 지수 백오프)
+- [x] 로그 파일 설정 (`Programs/logs/sync.log`)
 - [x] 동기화 결과 요약 로그 출력
 
 ### 테스트
-- [ ] Google 인증 테스트 (실제 credentials 필요 — 환경 구성 후 수동 확인)
-- [ ] MS 인증 테스트 (실제 Azure 앱 등록 필요 — 환경 구성 후 수동 확인)
-- [x] 이벤트 변환 단위 테스트 (24개 테스트 통과)
-- [x] 동기화 엔진 통합 테스트 (Mock 기반, 32개 테스트 통과)
+- [x] Google 인증 — 실제 credentials로 수동 확인 완료 (2026-06-30)
+- [x] Outlook COM 연결 — 로컬 Outlook으로 수동 확인 완료 (2026-06-30)
+- [x] 이벤트 변환 단위 테스트 (34개)
+- [x] 상태·락 단위 테스트 (18개)
+- [x] 동기화 엔진 통합 테스트 Mock 기반 (16개)
+- [x] **합계 68/68 통과** (2026-06-30)
 
 ### 배포
-- [ ] Windows Task Scheduler 등록 방법 문서화
-- [x] .env.example 작성 완료
-- [x] requirements.txt 작성 완료
+- [x] Windows Task Scheduler 등록 방법 문서화 (§12)
+- [x] `.env.example` 작성 완료
+- [x] `requirements.txt` 작성 완료
 
 ---
 
 ## 10. 완료 기준 (Definition of Done)
 
-- [ ] 기획서 체크리스트 전부 완료
-- [x] `Programs/test_code/`에서 테스트 통과 (56/56, 2026-06-29)
-- [ ] git 커밋 및 push
+- [x] 기획서 체크리스트 전부 완료
+- [x] `Programs/test_code/`에서 테스트 통과 (68/68)
+- [ ] git 커밋 및 push (문서 갱신 포함)
 - [ ] 기획서를 `Docs/Finished/`로 이동
+
+---
+
+## 11. 실행 검증 기록
+
+| 일시 | 내용 | 결과 |
+|---|---|---|
+| 2026-06-30 15:05 | Google OAuth 최초 인증 | ✅ `token_google.json` 저장 |
+| 2026-06-30 15:06 | 증분 동기화 1회차 | ✅ 추가 0건 |
+| 2026-06-30 15:37 | 최초 동기화 (실데이터) | ✅ **추가 26건** / 오류 0건 |
+| 2026-06-30 | pytest 전체 | ✅ **68 passed** |
+
+로그 위치: `Programs/logs/sync.log`
+
+---
+
+## 12. Windows Task Scheduler 등록
+
+1. **작업 만들기** → 이름: `CalendarSync`
+2. **트리거**: 30분마다 반복
+3. **동작**: 프로그램 시작
+   - 프로그램: `C:\Users\<사용자>\AppData\Local\Programs\Python\Python313\python.exe` (본인 환경에 맞게)
+   - 인수: `main.py`
+   - 시작 위치: `C:\Users\indyc\Desktop\antigravity\project\calendar_sync\Programs`
+4. **조건**: "컴퓨터의 AC 전원이 켜져 있을 때만" 해제 (노트북 배터리에서도 실행)
+5. **설정**: "이미 실행 중인 작업 적용 규칙" → **새 인스턴스 시작 안 함** (`sync.lock`과 이중 방어)
+
+> Outlook이 로그인된 상태여야 COM 연결이 성공합니다.

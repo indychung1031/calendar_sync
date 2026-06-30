@@ -171,6 +171,11 @@ class SyncEngine:
             self._last_sync.ms_delta_link
         )
 
+        # COM 방식(전체 스캔)은 삭제 이벤트가 목록에서 사라지므로 별도 감지 필요
+        # MS Graph 방식(delta)은 @removed 필드로 감지하므로 불필요
+        if not getattr(self._ms, "supports_delta", True):
+            self._detect_and_apply_outlook_deletions(ms_changes)
+
         # MS 변경을 outlook_id로 인덱싱 (충돌 해결에 사용)
         ms_change_by_id: dict[str, dict] = {e["id"]: e for e in ms_changes}
 
@@ -182,6 +187,17 @@ class SyncEngine:
 
         self._save_state(now_utc, now_utc, new_delta_link or self._last_sync.ms_delta_link)
         logger.info("증분 동기화 완료: %s", self.stats.summary())
+
+    def _detect_and_apply_outlook_deletions(self, current_outlook: list[dict]) -> None:
+        """event_map에 있지만 현재 Outlook 목록에 없는 이벤트 → Google에서 삭제.
+
+        COM 전체 스캔 방식에서만 사용. delta 방식은 @removed 필드로 감지한다.
+        """
+        current_ids = {e["id"] for e in current_outlook}
+        for g_id, entry in list(self._map.items()):
+            ms_id = entry["outlook_id"]
+            if ms_id not in current_ids:
+                self._delete_from_google(g_id, ms_id)
 
     def _apply_google_changes(
         self,
