@@ -71,7 +71,7 @@
 - **실행 주기**: 30분마다 자동 실행
 - **색상 동기화**: Google `colorId` ↔ Outlook `GSync-*` 카테고리 (Outlook에서 범주 색상은 수동 지정)
 - **삭제 처리 주의**: 실수 삭제가 반대편에도 전파됨 — 위험 수용 정책 (기획서 §4-4)
-- 상세 구현은 `Docs/01_Outlook_Google_캘린더_동기화_기획.md` 참조
+- 상세 구현은 `Docs/Finished/01_Outlook_Google_캘린더_동기화_기획.md` 참조
 
 ## CLI
 

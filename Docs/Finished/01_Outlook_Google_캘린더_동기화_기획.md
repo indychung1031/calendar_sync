@@ -301,8 +301,8 @@ SYNC_RECURRING_HORIZON_DAYS=365
 
 - [x] 기획서 체크리스트 전부 완료
 - [x] `Programs/test_code/`에서 테스트 통과 (68/68)
-- [ ] git 커밋 및 push (문서 갱신 포함)
-- [ ] 기획서를 `Docs/Finished/`로 이동
+- [x] git 커밋 및 push
+- [x] 기획서를 `Docs/Finished/`로 이동
 
 ---
 
