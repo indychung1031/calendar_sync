@@ -3,6 +3,7 @@
 import logging
 from datetime import datetime, timedelta, timezone
 
+from calendar_api.sync_window import sync_bounds
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.oauth2.credentials import Credentials
@@ -24,11 +25,12 @@ class GoogleCalendarClient:
         self._horizon_days = horizon_days
 
     def _window(self) -> tuple[str, str]:
-        """동기화 윈도우: [오늘 UTC 자정, 오늘+horizon] ISO 문자열 반환."""
-        now = datetime.now(timezone.utc)
-        time_min = now.isoformat()
-        time_max = (now + timedelta(days=self._horizon_days)).isoformat()
-        return time_min, time_max
+        """동기화 윈도우: [로컬 오늘 00:00, 오늘+horizon+1일 00:00) ISO 문자열."""
+        window_start, window_end = sync_bounds(self._horizon_days)
+        # Google API: timeMax는 exclusive — 자정 경계 사용
+        start_local = window_start.astimezone()
+        end_local = window_end.astimezone()
+        return start_local.isoformat(), end_local.isoformat()
 
     def list_events(self, updated_min: str | None = None) -> list[dict]:
         """
@@ -67,6 +69,25 @@ class GoogleCalendarClient:
                 break
 
         return events
+
+    def check_event_status(self, event_id: str) -> str:
+        """Google 일정 상태: active | cancelled | missing | unknown."""
+        try:
+            event = (
+                self._service.events()
+                .get(calendarId=self._cal_id, eventId=event_id)
+                .execute()
+            )
+            if event.get("status") == "cancelled":
+                return "cancelled"
+            return "active"
+        except HttpError as e:
+            if e.resp.status in (404, 410):
+                return "missing"
+            logger.warning(
+                "Google 존재 확인 실패 (id=%s) — 삭제 전파 보류: %s", event_id, e
+            )
+            return "unknown"
 
     def create_event(self, body: dict) -> dict:
         try:

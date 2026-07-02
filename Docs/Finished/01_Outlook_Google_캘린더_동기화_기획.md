@@ -50,8 +50,9 @@ Microsoft Outlook 캘린더와 Google 캘린더 간의 양방향 동기화 프�
 - **양방향**: Outlook ↔ Google 양쪽 모두 읽고 쓴다.
 
 ### 4-2. 동기화 범위 (기간)
-- **오늘 날짜 이후 미래 일정 전체** 동기화
-- 과거 일정은 동기화하지 않는다.
+- **오늘 날짜 00:00(로컬) 이후** ~ horizon 일까지 동기화
+- **'지금(now)'이 아닌 '오늘 자정'** 기준 — 당일 일정은 하루 종일 유지
+- 어제 이전 일정은 동기화 대상에서 제외 (과거 일정은 새로 가져오지 않음)
 
 ### 4-3. 충돌 처리 (같은 일정이 양쪽에서 동시에 수정된 경우)
 - **최신 수정 시각(last modified) 우선**
@@ -91,7 +92,7 @@ Microsoft Outlook 캘린더와 Google 캘린더 간의 양방향 동기화 프�
 - **Outlook** (`calendar_api/ms_calendar.py`): COM 전체 스캔
   - `IncludeRecurrences=True` + `Sort([Start])` + Restrict 날짜 필터
   - delta 미지원 → `ms_delta_link`는 `"outlook_com_v1"` 마커만 저장
-  - 삭제 감지: `event_map`에 있으나 현재 스캔 목록에 없는 Outlook ID → Google에서 삭제
+  - 삭제 감지: 스캔 목록에 없을 때 `GetItemFromID`로 **실제 삭제 여부 확인** 후 Google 삭제
 
 ### 5-3. 이벤트 변환
 - Google 이벤트 형식 ↔ Outlook 이벤트 형식 간 변환 (`event_mapper.py`)
@@ -331,3 +332,11 @@ SYNC_RECURRING_HORIZON_DAYS=365
 5. **설정**: "이미 실행 중인 작업 적용 규칙" → **새 인스턴스 시작 안 함** (`sync.lock`과 이중 방어)
 
 > Outlook이 로그인된 상태여야 COM 연결이 성공합니다.
+
+---
+
+## 13. 버그 수정 이력
+
+| 일시 | 증상 | 원인 | 수정 |
+|---|---|---|---|
+| 2026-07-02 | 7/2 일정이 7/2에 Google에서 사라짐 | 동기화 범위가 `now` 기준이라 당일 일정이 스캔에서 제외 → 삭제로 오인 | `sync_window.py` 도입 (오늘 00:00~), `event_exists()` 확인 추가 |

@@ -9,6 +9,8 @@ import logging
 import re
 from datetime import datetime, timedelta, timezone
 
+from calendar_api.sync_window import sync_bounds
+
 import pythoncom
 import win32com.client
 
@@ -90,17 +92,16 @@ class OutlookComClient:
         Restrict 필터는 로케일에 따라 동작이 달라지므로 Python에서 직접 필터링한다.
         Start 기준 정렬 후 범위를 벗어나면 break하여 성능을 확보한다.
         """
-        now = datetime.now()
-        end = now + timedelta(days=self._horizon_days)
+        window_start, window_end = sync_bounds(self._horizon_days)
 
         items = self._calendar.Items
         # IncludeRecurrences는 Sort 이전에 설정해야 반복 일정이 전개됨
         items.IncludeRecurrences = True
         items.Sort("[Start]")
 
-        # Restrict 필터로 날짜 범위 1차 축소 (MM/DD/YYYY 형식은 로케일 무관하게 동작)
-        start_str = now.strftime("%m/%d/%Y %H:%M")
-        end_str = end.strftime("%m/%d/%Y %H:%M")
+        # Restrict 필터로 날짜 범위 1차 축소 (오늘 00:00부터 — '지금'이 아님)
+        start_str = window_start.strftime("%m/%d/%Y %H:%M")
+        end_str = window_end.strftime("%m/%d/%Y %H:%M")
         filter_str = f"[Start] >= '{start_str}' AND [Start] < '{end_str}'"
         try:
             restricted = items.Restrict(filter_str)
@@ -115,9 +116,9 @@ class OutlookComClient:
                 # pywintypes.datetime은 naive datetime이므로 직접 비교 가능
                 s = item.Start
                 item_start = datetime(s.year, s.month, s.day, s.hour, s.minute, s.second)
-                if item_start < now:
+                if item_start < window_start:
                     continue
-                if item_start >= end:
+                if item_start >= window_end:
                     break
                 events.append(self._item_to_dict(item))
             except Exception as e:
@@ -183,6 +184,33 @@ class OutlookComClient:
         appt.Save()
         logger.debug("Outlook 이벤트 수정: %s", body.get("subject", ""))
         return self._item_to_dict(appt)
+
+    def check_event_status(self, entry_id: str) -> str:
+        """Outlook 일정 존재 여부: exists | missing | unknown."""
+        try:
+            appt = self._ns.GetItemFromID(entry_id)
+            if appt.Class == _OL_APPOINTMENT_CLASS:
+                return "exists"
+            logger.warning(
+                "Outlook EntryID %s 가 일정 타입이 아님 (class=%s)", entry_id, appt.Class
+            )
+            return "unknown"
+        except Exception as e:
+            err = str(e).lower()
+            # MAPI_E_NOT_FOUND 등 — 실제 삭제로 간주
+            if any(
+                token in err
+                for token in ("not found", "could not find", "8004010f", "0x8004010f")
+            ):
+                return "missing"
+            logger.warning(
+                "Outlook 존재 확인 실패 (id=%s) — 삭제 전파 보류: %s", entry_id, e
+            )
+            return "unknown"
+
+    def event_exists(self, entry_id: str) -> bool:
+        """하위 호환. exists일 때만 True."""
+        return self.check_event_status(entry_id) == "exists"
 
     def delete_event(self, entry_id: str) -> None:
         """Outlook 이벤트 삭제 (이미 삭제된 경우 무시)."""

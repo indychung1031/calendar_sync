@@ -148,11 +148,42 @@ class EventMap:
         google_modified: str,
         outlook_modified: str,
     ) -> None:
+        existing = self._data.get(google_id, {})
         self._data[google_id] = {
             "outlook_id": outlook_id,
             "google_modified": google_modified,
             "outlook_modified": outlook_modified,
+            "outlook_missing_since": existing.get("outlook_missing_since"),
+            "google_delete_pending_since": existing.get("google_delete_pending_since"),
         }
+
+    def mark_outlook_missing(self, google_id: str) -> None:
+        """Outlook 삭제 1차 감지 — 다음 동기화까지 보류."""
+        entry = self._data.get(google_id)
+        if entry and not entry.get("outlook_missing_since"):
+            entry["outlook_missing_since"] = datetime.now(timezone.utc).isoformat()
+
+    def clear_outlook_missing(self, google_id: str) -> None:
+        entry = self._data.get(google_id)
+        if entry:
+            entry.pop("outlook_missing_since", None)
+
+    def is_outlook_missing_pending(self, google_id: str) -> bool:
+        return bool(self._data.get(google_id, {}).get("outlook_missing_since"))
+
+    def mark_google_delete_pending(self, google_id: str) -> None:
+        """Google 삭제 1차 감지 — 다음 동기화까지 보류."""
+        entry = self._data.get(google_id)
+        if entry and not entry.get("google_delete_pending_since"):
+            entry["google_delete_pending_since"] = datetime.now(timezone.utc).isoformat()
+
+    def clear_google_delete_pending(self, google_id: str) -> None:
+        entry = self._data.get(google_id)
+        if entry:
+            entry.pop("google_delete_pending_since", None)
+
+    def is_google_delete_pending(self, google_id: str) -> bool:
+        return bool(self._data.get(google_id, {}).get("google_delete_pending_since"))
 
     def remove(self, google_id: str) -> None:
         self._data.pop(google_id, None)

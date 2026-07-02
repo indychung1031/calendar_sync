@@ -164,6 +164,14 @@ class SyncEngine:
         logger.info("증분 동기화 시작 (마지막 동기화: %s)", self._last_sync.last_sync_at)
         now_utc = datetime.now(timezone.utc).isoformat()
 
+        # 이번 sync 시작 전부터 보류 중이던 항목만 2차 삭제 대상
+        outlook_pending_before = {
+            g_id for g_id, _ in self._map.items() if self._map.is_outlook_missing_pending(g_id)
+        }
+        google_pending_before = {
+            g_id for g_id, _ in self._map.items() if self._map.is_google_delete_pending(g_id)
+        }
+
         google_changes = self._google.list_events(
             updated_min=self._last_sync.google_updated_min
         )
@@ -174,43 +182,104 @@ class SyncEngine:
         # COM 방식(전체 스캔)은 삭제 이벤트가 목록에서 사라지므로 별도 감지 필요
         # MS Graph 방식(delta)은 @removed 필드로 감지하므로 불필요
         if not getattr(self._ms, "supports_delta", True):
-            self._detect_and_apply_outlook_deletions(ms_changes)
+            self._detect_and_apply_outlook_deletions(
+                ms_changes, outlook_pending_before
+            )
 
         # MS 변경을 outlook_id로 인덱싱 (충돌 해결에 사용)
         ms_change_by_id: dict[str, dict] = {e["id"]: e for e in ms_changes}
 
         # Google 변경 처리 (충돌 시 ms_change_by_id에서 제거)
-        self._apply_google_changes(google_changes, ms_change_by_id)
+        self._apply_google_changes(
+            google_changes, ms_change_by_id, google_pending_before
+        )
 
         # 남은 MS 변경 처리 (Google에서 이미 처리된 항목 제외)
-        self._apply_ms_changes(list(ms_change_by_id.values()))
+        self._apply_ms_changes(
+            list(ms_change_by_id.values()), outlook_pending_before
+        )
+
+        # 1차 보류된 Google 삭제 2차 확인 (변경 feed에 없어도 처리)
+        self._process_pending_google_deletions(google_pending_before)
 
         self._save_state(now_utc, now_utc, new_delta_link or self._last_sync.ms_delta_link)
         logger.info("증분 동기화 완료: %s", self.stats.summary())
 
-    def _detect_and_apply_outlook_deletions(self, current_outlook: list[dict]) -> None:
-        """event_map에 있지만 현재 Outlook 목록에 없는 이벤트 → Google에서 삭제.
+    def _detect_and_apply_outlook_deletions(
+        self,
+        current_outlook: list[dict],
+        pending_before: set[str] | None = None,
+    ) -> None:
+        """event_map에 있지만 Outlook 스캔 목록에 없는 이벤트 처리.
 
-        COM 전체 스캔 방식에서만 사용. delta 방식은 @removed 필드로 감지한다.
+        COM 오류(unknown) 시 삭제하지 않음.
+        missing 확인 시 2회 연속(2 sync 주기) 후에만 Google 삭제.
         """
+        pending_before = pending_before or set()
         current_ids = {e["id"] for e in current_outlook}
+        check_status = getattr(self._ms, "check_event_status", None)
+
         for g_id, entry in list(self._map.items()):
             ms_id = entry["outlook_id"]
-            if ms_id not in current_ids:
-                self._delete_from_google(g_id, ms_id)
+
+            if ms_id in current_ids:
+                self._map.clear_outlook_missing(g_id)
+                continue
+
+            if check_status:
+                status = check_status(ms_id)
+            else:
+                status = "exists" if self._ms.event_exists(ms_id) else "missing"
+
+            if status == "exists":
+                self._map.clear_outlook_missing(g_id)
+                logger.debug(
+                    "Outlook 일정 스캔 목록에 없지만 존재함 (id=%s) → Google 삭제 안 함",
+                    ms_id,
+                )
+                continue
+
+            if status == "unknown":
+                logger.warning(
+                    "Outlook 존재 확인 불가 (google_id=%s, outlook_id=%s) → 삭제 보류",
+                    g_id,
+                    ms_id,
+                )
+                continue
+
+            # status == "missing" — 2회 연속 확인 후 삭제
+            if not self._map.is_outlook_missing_pending(g_id):
+                self._map.mark_outlook_missing(g_id)
+                logger.info(
+                    "Outlook 삭제 1차 감지 (google_id=%s) — 다음 동기화까지 보류",
+                    g_id,
+                )
+                continue
+
+            if g_id not in pending_before:
+                continue
+
+            logger.info(
+                "Outlook 삭제 2차 확인 (google_id=%s) → Google에서 삭제",
+                g_id,
+            )
+            self._delete_from_google(g_id, ms_id)
 
     def _apply_google_changes(
         self,
         changes: list[dict],
         ms_change_by_id: dict[str, dict],
+        google_pending_before: set[str] | None = None,
     ) -> None:
+        google_pending_before = google_pending_before or set()
         for event in changes:
             g_id = event["id"]
             entry = self._map.get(g_id)
 
             if is_google_deleted(event):
                 if entry:
-                    self._delete_from_outlook(g_id, entry["outlook_id"])
+                    if self._should_delete_outlook(g_id, event, google_pending_before):
+                        self._delete_from_outlook(g_id, entry["outlook_id"])
                     ms_change_by_id.pop(entry["outlook_id"], None)
                 continue
 
@@ -219,6 +288,8 @@ class SyncEngine:
             if entry is None:
                 self._create_in_outlook(event)
                 continue
+
+            self._map.clear_google_delete_pending(g_id)
 
             if current_g_modified == entry["google_modified"]:
                 # 우리가 동기화한 결과물 → 무한 루프 방지를 위해 건너뜀
@@ -236,14 +307,21 @@ class SyncEngine:
             else:
                 self._update_in_outlook(event, entry)
 
-    def _apply_ms_changes(self, changes: list[dict]) -> None:
+    def _apply_ms_changes(
+        self,
+        changes: list[dict],
+        outlook_pending_before: set[str] | None = None,
+    ) -> None:
+        outlook_pending_before = outlook_pending_before or set()
         for event in changes:
             ms_id = event["id"]
             g_id = self._map.find_by_outlook_id(ms_id)
             entry = self._map.get(g_id) if g_id else None
 
             if is_outlook_deleted(event):
-                if g_id:
+                if g_id and self._should_delete_google(
+                    g_id, ms_id, outlook_pending_before
+                ):
                     self._delete_from_google(g_id, ms_id)
                 continue
 
@@ -253,10 +331,100 @@ class SyncEngine:
                 self._create_in_google(event)
                 continue
 
+            self._map.clear_outlook_missing(g_id)
+
             if current_ms_modified == entry["outlook_modified"]:
                 continue
 
             self._update_in_google(event, g_id, entry)
+
+    # ── 삭제 안전장치 ─────────────────────────────────────────────────────
+
+    def _should_delete_google(
+        self, g_id: str, outlook_id: str, pending_before: set[str]
+    ) -> bool:
+        """Outlook 삭제 전 Google API로 재확인 + 2회 연속 pending."""
+        check_status = getattr(self._ms, "check_event_status", None)
+        if check_status:
+            status = check_status(outlook_id)
+            if status == "exists":
+                self._map.clear_outlook_missing(g_id)
+                return False
+            if status == "unknown":
+                logger.warning(
+                    "Outlook 삭제 신호였으나 존재 확인 불가 (outlook_id=%s) → Google 삭제 보류",
+                    outlook_id,
+                )
+                return False
+        if not self._map.is_outlook_missing_pending(g_id):
+            self._map.mark_outlook_missing(g_id)
+            logger.info(
+                "Outlook 삭제 1차 감지 (google_id=%s) — 다음 동기화까지 보류", g_id
+            )
+            return False
+        if g_id not in pending_before:
+            return False
+        return True
+
+    def _should_delete_outlook(
+        self, g_id: str, event: dict, pending_before: set[str]
+    ) -> bool:
+        """Google 삭제(cancelled) 전 API 재확인 + 2회 연속 pending."""
+        check_status = getattr(self._google, "check_event_status", None)
+        if check_status:
+            status = check_status(g_id)
+            if status == "active":
+                self._map.clear_google_delete_pending(g_id)
+                logger.info(
+                    "Google cancelled 신호였으나 일정 활성 (google_id=%s) → Outlook 삭제 안 함",
+                    g_id,
+                )
+                return False
+            if status == "unknown":
+                logger.warning(
+                    "Google 삭제 확인 불가 (google_id=%s) → Outlook 삭제 보류", g_id
+                )
+                return False
+        elif not is_google_deleted(event):
+            return False
+
+        if not self._map.is_google_delete_pending(g_id):
+            self._map.mark_google_delete_pending(g_id)
+            logger.info(
+                "Google 삭제 1차 감지 (google_id=%s) — 다음 동기화까지 보류", g_id
+            )
+            return False
+        if g_id not in pending_before:
+            return False
+        logger.info("Google 삭제 2차 확인 (google_id=%s) → Outlook에서 삭제", g_id)
+        return True
+
+    def _process_pending_google_deletions(self, pending_before: set[str]) -> None:
+        """1차 보류된 Google 삭제를 API 재확인 후 2차 처리."""
+        check_status = getattr(self._google, "check_event_status", None)
+        if not check_status:
+            return
+
+        for g_id, entry in list(self._map.items()):
+            if not self._map.is_google_delete_pending(g_id):
+                continue
+            if g_id not in pending_before:
+                continue
+            status = check_status(g_id)
+            if status == "active":
+                self._map.clear_google_delete_pending(g_id)
+                logger.info(
+                    "Google 삭제 보류 해제 — 일정 활성 (google_id=%s)", g_id
+                )
+            elif status == "unknown":
+                logger.warning(
+                    "Google 삭제 2차 확인 불가 (google_id=%s) → 보류 유지", g_id
+                )
+            elif status in ("cancelled", "missing"):
+                logger.info(
+                    "Google 삭제 2차 확인 (google_id=%s) → Outlook에서 삭제", g_id
+                )
+                self._delete_from_outlook(g_id, entry["outlook_id"])
 
     # ── 개별 작업 ─────────────────────────────────────────────────────────
 

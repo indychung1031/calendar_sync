@@ -244,9 +244,10 @@ class TestIncrementalSync:
         ms.update_event.assert_not_called()
 
     def test_delete_from_outlook_when_google_deleted(self, tmp_path):
-        """Google 이벤트 삭제 시 Outlook도 삭제 + event_map 제거."""
+        """Google cancelled 2회 확인 후 Outlook 삭제."""
         engine, google, ms = _make_engine(tmp_path)
         self._setup_existing_mapping(engine)
+        google.check_event_status.return_value = "cancelled"
 
         google.list_events.return_value = [
             _google_event("g1", status="cancelled")
@@ -254,15 +255,22 @@ class TestIncrementalSync:
         ms.list_events_delta.return_value = ([], "https://delta.link2")
 
         engine.run()
+        ms.delete_event.assert_not_called()
+        assert engine._map.is_google_delete_pending("g1")
+
+        google.list_events.return_value = []
+        engine.run()
 
         ms.delete_event.assert_called_once_with("o1")
-        assert engine._map.get("g1") is None  # 즉시 제거 확인
+        assert engine._map.get("g1") is None
         assert engine.stats.deleted == 1
 
     def test_delete_from_google_when_ms_deleted(self, tmp_path):
-        """MS 이벤트 삭제 시 Google도 삭제 + event_map 제거."""
+        """MS @removed 삭제 시 2회 확인 후 Google도 삭제."""
         engine, google, ms = _make_engine(tmp_path)
         self._setup_existing_mapping(engine)
+        ms.supports_delta = False
+        ms.check_event_status.return_value = "missing"
 
         google.list_events.return_value = []
         ms.list_events_delta.return_value = (
@@ -270,6 +278,11 @@ class TestIncrementalSync:
             "https://delta.link2",
         )
 
+        engine.run()
+        google.delete_event.assert_not_called()
+        assert engine._map.is_outlook_missing_pending("g1")
+
+        ms.list_events_delta.return_value = ([], "https://delta.link2")
         engine.run()
 
         google.delete_event.assert_called_once_with("g1")
@@ -326,15 +339,22 @@ class TestOutlookComDeletion:
         return engine, google, ms
 
     def test_detect_outlook_deletion_and_remove_from_google(self, tmp_path):
-        """Outlook 이벤트가 사라지면 Google에서도 삭제 + event_map 제거."""
+        """Outlook 이벤트가 2회 연속 missing이면 Google에서도 삭제."""
         engine, google, ms = self._setup_com_engine(tmp_path)
 
-        # Outlook 전체 스캔 결과에 o1이 없음 → 삭제된 것
         ms.list_events_delta.return_value = ([], "outlook_com_v1")
+        ms.check_event_status.return_value = "missing"
         google.list_events.return_value = []
 
+        # 1차: 보류만
         engine.run()
+        google.delete_event.assert_not_called()
+        assert engine._map.get("g1") is not None
+        assert engine._map.is_outlook_missing_pending("g1")
 
+        # 2차: 삭제
+        engine.run()
+        ms.check_event_status.assert_called_with("o1")
         google.delete_event.assert_called_once_with("g1")
         assert engine._map.get("g1") is None
         assert engine.stats.deleted == 1
@@ -354,3 +374,53 @@ class TestOutlookComDeletion:
 
         google.delete_event.assert_not_called()
         assert engine._map.get("g1") is not None
+
+    def test_no_false_deletion_when_event_outside_scan_but_still_in_outlook(self, tmp_path):
+        """스캔 목록에 없어도 Outlook에 존재하면 Google에서 삭제하지 않음."""
+        engine, google, ms = self._setup_com_engine(tmp_path)
+
+        ms.list_events_delta.return_value = ([], "outlook_com_v1")
+        ms.check_event_status.return_value = "exists"
+        google.list_events.return_value = []
+
+        engine.run()
+
+        ms.check_event_status.assert_called_once_with("o1")
+        google.delete_event.assert_not_called()
+        assert engine._map.get("g1") is not None
+
+    def test_no_deletion_when_outlook_status_unknown(self, tmp_path):
+        """COM 오류(unknown) 시 Google에서 삭제하지 않음."""
+        engine, google, ms = self._setup_com_engine(tmp_path)
+
+        ms.list_events_delta.return_value = ([], "outlook_com_v1")
+        ms.check_event_status.return_value = "unknown"
+        google.list_events.return_value = []
+
+        engine.run()
+        engine.run()
+
+        google.delete_event.assert_not_called()
+        assert engine._map.get("g1") is not None
+
+    def test_google_delete_requires_two_confirmations(self, tmp_path):
+        """Google cancelled도 API 재확인 + 2회 연속 후 Outlook 삭제."""
+        engine, google, ms = _make_engine(tmp_path)
+        ms.supports_delta = True
+        engine._map.set("g1", "o1", "2025-06-29T00:30:00Z", "2025-06-29T00:30:00Z")
+        engine._last_sync.last_sync_at = "2025-06-29T00:30:00Z"
+        engine._last_sync.google_updated_min = "2025-06-29T00:30:00Z"
+
+        cancelled = _google_event("g1", status="cancelled")
+        google.list_events.return_value = [cancelled]
+        google.check_event_status.return_value = "cancelled"
+        ms.list_events_delta.return_value = ([], "link")
+
+        engine.run()
+        ms.delete_event.assert_not_called()
+        assert engine._map.is_google_delete_pending("g1")
+
+        google.list_events.return_value = []
+        engine.run()
+        ms.delete_event.assert_called_once_with("o1")
+        assert engine._map.get("g1") is None
