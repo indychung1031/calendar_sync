@@ -81,10 +81,14 @@
 
 ```bash
 cd Programs
-python main.py                   # 동기화 실행
+python main.py                   # 동기화 (콘솔 출력, 수동 실행용)
+python main.py --quiet           # 로그 파일만 (pythonw / 스케줄러용)
+run_sync.vbs                     # 창 없이 실행 (Task Scheduler 권장)
 python main.py --list-calendars  # Google 캘린더 ID 목록
 python main.py --rebuild-map     # event_map 재구성 (중복 복구)
 ```
+
+Task Scheduler는 **`wscript.exe` + `run_sync.vbs`** 로 등록 (CMD 창 안 뜸). 로그는 `Programs/logs/sync.log`.
 
 ## 로그·에러 처리
 

@@ -25,15 +25,28 @@ from sync.sync_engine import SyncEngine
 _LOG_DIR = Path(__file__).parent / "logs"
 
 
-def setup_logging() -> None:
+def _has_console() -> bool:
+    """Windows 콘솔 창이 있는지 (pythonw / VBS 숨김 실행이면 False)."""
+    if sys.platform != "win32":
+        return bool(sys.stdout and sys.stdout.isatty())
+    try:
+        import ctypes
+        return bool(ctypes.windll.kernel32.GetConsoleWindow())
+    except Exception:
+        return False
+
+
+def setup_logging(*, quiet: bool = False) -> None:
     _LOG_DIR.mkdir(exist_ok=True)
+    handlers: list[logging.Handler] = [
+        logging.FileHandler(_LOG_DIR / "sync.log", encoding="utf-8"),
+    ]
+    if not quiet and _has_console():
+        handlers.insert(0, logging.StreamHandler(sys.stdout))
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler(_LOG_DIR / "sync.log", encoding="utf-8"),
-        ],
+        handlers=handlers,
     )
 
 
@@ -51,13 +64,18 @@ def parse_args() -> argparse.Namespace:
         dest="list_calendars",
         help="Google 캘린더 목록과 ID를 출력 (GOOGLE_CALENDAR_ID 설정 참고용)",
     )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="콘솔 출력 없음 (Task Scheduler / pythonw 실행용, 로그는 sync.log)",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
-    setup_logging()
-    logger = logging.getLogger(__name__)
     args = parse_args()
+    setup_logging(quiet=args.quiet or not _has_console())
+    logger = logging.getLogger(__name__)
 
     # ── 동시 실행 방지 ────────────────────────────────────────────────────
     if not acquire_lock():

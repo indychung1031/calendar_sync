@@ -320,18 +320,22 @@ SYNC_RECURRING_HORIZON_DAYS=365
 
 ---
 
-## 12. Windows Task Scheduler 등록
+## 12. Windows Task Scheduler 등록 (창 없이 실행)
+
+**CMD 창이 뜨지 않도록 `run_sync.vbs` 사용 (권장)**
 
 1. **작업 만들기** → 이름: `CalendarSync`
 2. **트리거**: 30분마다 반복
 3. **동작**: 프로그램 시작
-   - 프로그램: `C:\Users\<사용자>\AppData\Local\Programs\Python\Python313\python.exe` (본인 환경에 맞게)
-   - 인수: `main.py`
+   - 프로그램: `C:\Windows\System32\wscript.exe`
+   - 인수: `"C:\Users\indyc\Desktop\antigravity\project\calendar_sync\Programs\run_sync.vbs"`
    - 시작 위치: `C:\Users\indyc\Desktop\antigravity\project\calendar_sync\Programs`
 4. **조건**: "컴퓨터의 AC 전원이 켜져 있을 때만" 해제 (노트북 배터리에서도 실행)
-5. **설정**: "이미 실행 중인 작업 적용 규칙" → **새 인스턴스 시작 안 함** (`sync.lock`과 이중 방어)
+5. **설정**: "이미 실행 중인 작업 적용 규칙" → **새 인스턴스 시작 안 함**
 
-> Outlook이 로그인된 상태여야 COM 연결이 성공합니다.
+> `python.exe main.py`로 등록하면 매번 CMD 창이 뜹니다. **`run_sync.vbs`** 또는 **`pythonw.exe main.py --quiet`** 를 사용하세요.
+>
+> 수동 확인·디버그: `python main.py` (콘솔 출력) / 로그: `Programs/logs/sync.log`
 
 ---
 
