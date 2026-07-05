@@ -185,6 +185,28 @@ class OutlookComClient:
         logger.debug("Outlook 이벤트 수정: %s", body.get("subject", ""))
         return self._item_to_dict(appt)
 
+    def get_event(self, entry_id: str) -> dict | None:
+        """EntryID로 일정 조회 (동기화 윈도우 무관). 없으면 None."""
+        try:
+            appt = self._ns.GetItemFromID(entry_id)
+            if appt.Class != _OL_APPOINTMENT_CLASS:
+                logger.warning(
+                    "Outlook EntryID %s 가 일정 타입이 아님 (class=%s)",
+                    entry_id,
+                    appt.Class,
+                )
+                return None
+            return self._item_to_dict(appt)
+        except Exception as e:
+            err = str(e).lower()
+            if any(
+                token in err
+                for token in ("not found", "could not find", "8004010f", "0x8004010f")
+            ):
+                return None
+            logger.warning("Outlook 이벤트 조회 실패 (id=%s): %s", entry_id, e)
+            raise
+
     def check_event_status(self, entry_id: str) -> str:
         """Outlook 일정 존재 여부: exists | missing | unknown."""
         try:

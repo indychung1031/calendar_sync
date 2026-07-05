@@ -199,6 +199,12 @@ class SyncEngine:
             list(ms_change_by_id.values()), outlook_pending_before
         )
 
+        # 윈도우 밖으로 날짜 이동한 매핑 일정 보정 (ID 직접 조회)
+        self._reconcile_out_of_window_mapped(
+            google_changes,
+            ms_changes,
+        )
+
         # 1차 보류된 Google 삭제 2차 확인 (변경 feed에 없어도 처리)
         self._process_pending_google_deletions(google_pending_before)
 
@@ -337,6 +343,98 @@ class SyncEngine:
                 continue
 
             self._update_in_google(event, g_id, entry)
+
+    def _reconcile_out_of_window_mapped(
+        self,
+        google_changes: list[dict],
+        ms_changes: list[dict],
+    ) -> None:
+        """동기화 윈도우 밖으로 이동한 매핑 일정을 ID 조회로 보정.
+
+        한쪽만 스캔 feed에 포함될 때(미래→과거 날짜 이동 등) 반대편에 변경을 전파한다.
+        양쪽 모두 윈도우 밖이면 조회하지 않는다 (과거 일정 신규 유입 방지).
+        """
+        get_google = getattr(self._google, "get_event", None)
+        get_ms = getattr(self._ms, "get_event", None)
+        if not get_google or not get_ms:
+            return
+
+        google_by_id = {e["id"]: e for e in google_changes}
+        ms_by_id = {e["id"]: e for e in ms_changes}
+
+        for g_id, entry in list(self._map.items()):
+            ms_id = entry["outlook_id"]
+            g_in_feed = g_id in google_by_id
+            ms_in_scan = ms_id in ms_by_id
+
+            if g_in_feed and ms_in_scan:
+                continue
+            if not g_in_feed and not ms_in_scan:
+                continue
+
+            try:
+                if not g_in_feed and ms_in_scan:
+                    self._reconcile_google_moved_out(g_id, entry, ms_by_id[ms_id])
+                elif g_in_feed and not ms_in_scan:
+                    self._reconcile_outlook_moved_out(
+                        g_id, entry, google_by_id[g_id]
+                    )
+            except Exception as e:
+                logger.error(
+                    "윈도우 밖 매핑 보정 실패 (google_id=%s): %s", g_id, e
+                )
+                self.stats.errors += 1
+
+    def _reconcile_google_moved_out(
+        self, g_id: str, entry: dict, ms_event: dict
+    ) -> None:
+        """Google이 윈도우 밖으로 이동·변경됐을 때 Outlook에 반영."""
+        g_event = self._google.get_event(g_id)
+        if g_event is None:
+            return
+
+        if is_google_deleted(g_event):
+            logger.debug(
+                "윈도우 밖 Google 삭제 감지 (google_id=%s) — 일반 삭제 흐름에 위임",
+                g_id,
+            )
+            return
+
+        g_modified = g_event.get("updated", "")
+        if g_modified == entry["google_modified"]:
+            return
+
+        ms_modified = ms_event.get("lastModifiedDateTime", "")
+        if g_modified >= ms_modified:
+            logger.info(
+                "윈도우 밖 Google 변경 → Outlook 반영 (google_id=%s)", g_id
+            )
+            self._update_in_outlook(g_event, entry)
+
+    def _reconcile_outlook_moved_out(
+        self,
+        g_id: str,
+        entry: dict,
+        g_event: dict,
+    ) -> None:
+        """Outlook이 윈도우 밖으로 이동·변경됐을 때 Google에 반영."""
+        if is_google_deleted(g_event):
+            return
+
+        ms_event = self._ms.get_event(entry["outlook_id"])
+        if ms_event is None:
+            return
+
+        ms_modified = ms_event.get("lastModifiedDateTime", "")
+        if ms_modified == entry["outlook_modified"]:
+            return
+
+        g_modified = g_event.get("updated", "")
+        if ms_modified >= g_modified:
+            logger.info(
+                "윈도우 밖 Outlook 변경 → Google 반영 (google_id=%s)", g_id
+            )
+            self._update_in_google(ms_event, g_id, entry)
 
     # ── 삭제 안전장치 ─────────────────────────────────────────────────────
 

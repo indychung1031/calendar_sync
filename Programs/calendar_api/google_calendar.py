@@ -70,22 +70,32 @@ class GoogleCalendarClient:
 
         return events
 
-    def check_event_status(self, event_id: str) -> str:
-        """Google 일정 상태: active | cancelled | missing | unknown."""
+    def get_event(self, event_id: str) -> dict | None:
+        """ID로 일정 조회 (동기화 윈도우 무관). 없으면 None."""
         try:
-            event = (
+            return (
                 self._service.events()
                 .get(calendarId=self._cal_id, eventId=event_id)
                 .execute()
             )
+        except HttpError as e:
+            if e.resp.status in (404, 410):
+                return None
+            logger.warning("Google 이벤트 조회 실패 (id=%s): %s", event_id, e)
+            raise
+
+    def check_event_status(self, event_id: str) -> str:
+        """Google 일정 상태: active | cancelled | missing | unknown."""
+        try:
+            event = self.get_event(event_id)
+            if event is None:
+                return "missing"
             if event.get("status") == "cancelled":
                 return "cancelled"
             return "active"
-        except HttpError as e:
-            if e.resp.status in (404, 410):
-                return "missing"
+        except HttpError:
             logger.warning(
-                "Google 존재 확인 실패 (id=%s) — 삭제 전파 보류: %s", event_id, e
+                "Google 존재 확인 실패 (id=%s) — 삭제 전파 보류", event_id
             )
             return "unknown"
 

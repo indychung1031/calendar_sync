@@ -424,3 +424,105 @@ class TestOutlookComDeletion:
         engine.run()
         ms.delete_event.assert_called_once_with("o1")
         assert engine._map.get("g1") is None
+
+
+# ── 윈도우 밖 매핑 일정 보정 ───────────────────────────────────────────────
+
+class TestOutOfWindowReconciliation:
+    def _setup_mapped(self, engine: SyncEngine) -> None:
+        engine._map.set("g1", "o1", "2025-06-29T00:30:00Z", "2025-06-29T00:30:00Z")
+        engine._last_sync.last_sync_at = "2025-06-29T00:30:00Z"
+        engine._last_sync.google_updated_min = "2025-06-29T00:30:00Z"
+        engine._last_sync.ms_delta_link = "https://delta.link"
+
+    def test_google_moved_to_past_updates_outlook(self, tmp_path):
+        """Google이 윈도우 밖(과거)으로 이동하면 ID 조회 후 Outlook 반영."""
+        engine, google, ms = _make_engine(tmp_path)
+        self._setup_mapped(engine)
+
+        # Google feed에는 없음(윈도우 밖), Outlook 스캔에는 아직 이전 날짜로 존재
+        google.list_events.return_value = []
+        ms.list_events_delta.return_value = (
+            [_ms_event("o1", utc_start="2025-07-06T00:00:00.0000000")],
+            "https://delta.link2",
+        )
+        google.get_event.return_value = _google_event(
+            "g1",
+            utc_start="2025-07-03T00:00:00Z",
+            utc_end="2025-07-03T01:00:00Z",
+            updated="2025-07-05T01:00:00Z",
+        )
+        ms.update_event.return_value = _ms_event(
+            "o1",
+            utc_start="2025-07-03T00:00:00.0000000",
+            last_modified="2025-07-05T01:01:00Z",
+        )
+
+        engine.run()
+
+        google.get_event.assert_called_once_with("g1")
+        ms.update_event.assert_called_once()
+        assert engine.stats.updated == 1
+
+    def test_outlook_moved_to_past_updates_google(self, tmp_path):
+        """Outlook이 윈도우 밖(과거)으로 이동하면 ID 조회 후 Google 반영."""
+        engine, google, ms = _make_engine(tmp_path)
+        self._setup_mapped(engine)
+
+        google.list_events.return_value = [
+            _google_event(
+                "g1",
+                utc_start="2025-07-06T00:00:00Z",
+                updated="2025-06-29T00:30:00Z",
+            )
+        ]
+        ms.list_events_delta.return_value = ([], "https://delta.link2")
+        ms.get_event.return_value = _ms_event(
+            "o1",
+            utc_start="2025-07-03T00:00:00.0000000",
+            last_modified="2025-07-05T02:00:00Z",
+        )
+        google.update_event.return_value = _google_event(
+            "g1",
+            utc_start="2025-07-03T00:00:00Z",
+            updated="2025-07-05T02:01:00Z",
+        )
+
+        engine.run()
+
+        ms.get_event.assert_called_once_with("o1")
+        google.update_event.assert_called_once()
+        assert engine.stats.updated == 1
+
+    def test_both_outside_window_skips_fetch(self, tmp_path):
+        """양쪽 모두 윈도우 밖이면 ID 조회하지 않음."""
+        engine, google, ms = _make_engine(tmp_path)
+        self._setup_mapped(engine)
+
+        google.list_events.return_value = []
+        ms.list_events_delta.return_value = ([], "https://delta.link2")
+
+        engine.run()
+
+        google.get_event.assert_not_called()
+        ms.get_event.assert_not_called()
+        ms.update_event.assert_not_called()
+        google.update_event.assert_not_called()
+
+    def test_google_unchanged_skips_outlook_update(self, tmp_path):
+        """Google ID 조회 결과 변경 없으면 Outlook 업데이트 안 함."""
+        engine, google, ms = _make_engine(tmp_path)
+        self._setup_mapped(engine)
+
+        google.list_events.return_value = []
+        ms.list_events_delta.return_value = (
+            [_ms_event("o1")],
+            "https://delta.link2",
+        )
+        google.get_event.return_value = _google_event(
+            "g1", updated="2025-06-29T00:30:00Z"
+        )
+
+        engine.run()
+
+        ms.update_event.assert_not_called()
