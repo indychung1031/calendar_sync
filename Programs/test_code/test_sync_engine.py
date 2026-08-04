@@ -289,6 +289,39 @@ class TestIncrementalSync:
         assert engine._map.get("g1") is None
         assert engine.stats.deleted == 1
 
+    def test_outlook_missing_pending_blocks_google_update_to_outlook(self, tmp_path):
+        """Outlook 삭제 1차 감지 후 Google 변경이 Outlook으로 전파되지 않음.
+
+        Outlook 이벤트가 삭제된 sync(1차 감지)에서 Google 이벤트가 동시에 수정된 경우,
+        삭제된 Outlook 항목에 update를 시도하면 COM 예외 발생 → 불필요한 에러 로그.
+        이를 방지하기 위해 outlook_missing_pending 체크 후 skip해야 한다.
+        """
+        engine, google, ms = _make_engine(tmp_path)
+        ms.supports_delta = False
+
+        # 매핑 등록 (Outlook 삭제 전 상태 — 1차 sync 시작)
+        engine._map.set("g1", "o1", "2025-06-29T00:30:00Z", "2025-06-29T00:30:00Z")
+        engine._last_sync.last_sync_at = "2025-06-29T01:00:00Z"
+        engine._last_sync.google_updated_min = "2025-06-29T01:00:00Z"
+        engine._last_sync.ms_delta_link = "outlook_com_v1"
+
+        # 1차 sync: Outlook o1 없음(삭제됨) + Google g1은 수정돼 feed에 등장
+        google.list_events.return_value = [
+            _google_event("g1", updated="2025-06-29T01:30:00Z")  # 수정 시각 다름
+        ]
+        ms.list_events_delta.return_value = ([], "outlook_com_v1")  # o1 없음
+        ms.check_event_status.return_value = "missing"  # ID 조회도 없음
+        ms.get_event.return_value = None
+
+        engine.run()
+
+        # 삭제된 Outlook 항목에 update 시도 없어야 함 (COM 예외 방지)
+        ms.update_event.assert_not_called()
+        # 1차 감지 상태이므로 에러 카운트 없어야 함
+        assert engine.stats.errors == 0
+        # outlook_missing_pending 상태 확인
+        assert engine._map.is_outlook_missing_pending("g1")
+
     def test_new_google_event_creates_in_outlook(self, tmp_path):
         """event_map에 없는 Google 이벤트 → Outlook 신규 생성."""
         engine, google, ms = _make_engine(tmp_path)
@@ -403,6 +436,41 @@ class TestOutlookComDeletion:
         google.delete_event.assert_not_called()
         assert engine._map.get("g1") is not None
 
+    def test_google_delete_pending_blocks_outlook_update_to_google(self, tmp_path):
+        """Google 삭제 보류 중일 때 Outlook 변경이 Google로 전파(복원)되지 않음.
+
+        2차 sync에서 Google API가 updated_min 이후 변경 없음 → cancelled 미반환.
+        Outlook 이벤트가 스캔에 있고 수정 시각이 다를 때 Google.update_event를
+        호출하면 취소된 이벤트가 복원됨 — 이를 방지해야 한다.
+        """
+        engine, google, ms = _make_engine(tmp_path)
+        ms.supports_delta = False
+
+        # 1차 sync 직후 상태: g1↔o1 매핑 + google_delete_pending 설정됨
+        engine._map.set("g1", "o1", "2025-06-29T00:30:00Z", "2025-06-29T00:30:00Z")
+        engine._map.mark_google_delete_pending("g1")
+        engine._last_sync.last_sync_at = "2025-06-29T01:00:00Z"
+        engine._last_sync.google_updated_min = "2025-06-29T01:00:00Z"
+        engine._last_sync.ms_delta_link = "outlook_com_v1"
+
+        # 2차 sync: Google feed에 cancelled 없음, Outlook 스캔에 o1이 수정 시각 달리 있음
+        google.list_events.return_value = []
+        ms.list_events_delta.return_value = (
+            [_ms_event("o1", last_modified="2025-06-29T01:30:00Z")],  # 수정 시각 다름
+            "outlook_com_v1",
+        )
+        ms.check_event_status.return_value = "exists"  # Outlook에 아직 존재
+        google.check_event_status.return_value = "cancelled"  # Google에서는 삭제됨
+
+        engine.run()
+
+        # Outlook→Google 업데이트(취소된 이벤트 복원) 발생하면 안 됨
+        google.update_event.assert_not_called()
+        # _process_pending_google_deletions에서 Outlook 삭제 처리
+        ms.delete_event.assert_called_once_with("o1")
+        assert engine._map.get("g1") is None
+        assert engine.stats.deleted == 1
+
     def test_google_delete_requires_two_confirmations(self, tmp_path):
         """Google cancelled도 API 재확인 + 2회 연속 후 Outlook 삭제."""
         engine, google, ms = _make_engine(tmp_path)
@@ -464,8 +532,8 @@ class TestOutOfWindowReconciliation:
         ms.update_event.assert_called_once()
         assert engine.stats.updated == 1
 
-    def test_outlook_moved_to_past_updates_google(self, tmp_path):
-        """Outlook이 윈도우 밖(과거)으로 이동하면 ID 조회 후 Google 반영."""
+    def test_outlook_moved_to_past_with_google_still_in_feed(self, tmp_path):
+        """Outlook만 과거로 이동·Google은 feed에 있으면 Outlook→Google 반영."""
         engine, google, ms = _make_engine(tmp_path)
         self._setup_mapped(engine)
 
@@ -494,18 +562,90 @@ class TestOutOfWindowReconciliation:
         google.update_event.assert_called_once()
         assert engine.stats.updated == 1
 
-    def test_both_outside_window_skips_fetch(self, tmp_path):
-        """양쪽 모두 윈도우 밖이면 ID 조회하지 않음."""
+    def test_outlook_moved_to_past_both_outside_updates_google(self, tmp_path):
+        """양쪽 feed에 없어도 Outlook 과거 이동이 Google에 반영."""
         engine, google, ms = _make_engine(tmp_path)
         self._setup_mapped(engine)
 
         google.list_events.return_value = []
         ms.list_events_delta.return_value = ([], "https://delta.link2")
+        google.get_event.return_value = _google_event(
+            "g1",
+            utc_start="2025-07-06T00:00:00Z",
+            updated="2025-06-29T00:30:00Z",
+        )
+        ms.get_event.return_value = _ms_event(
+            "o1",
+            utc_start="2025-07-03T00:00:00.0000000",
+            last_modified="2025-07-05T02:00:00Z",
+        )
+        google.update_event.return_value = _google_event(
+            "g1",
+            utc_start="2025-07-03T00:00:00Z",
+            updated="2025-07-05T02:01:00Z",
+        )
 
         engine.run()
 
-        google.get_event.assert_not_called()
-        ms.get_event.assert_not_called()
+        google.get_event.assert_called_once_with("g1")
+        ms.get_event.assert_called_once_with("o1")
+        google.update_event.assert_called_once()
+        ms.update_event.assert_not_called()
+        assert engine.stats.updated == 1
+
+    def test_google_past_move_wins_over_outlook_drift(self, tmp_path):
+        """Google 과거 이동이 Outlook lastModified 드리프트보다 최신이면 되돌리지 않음."""
+        engine, google, ms = _make_engine(tmp_path)
+        self._setup_mapped(engine)
+
+        google.list_events.return_value = []
+        # Outlook은 아직 미래 날짜이지만 lastModified만 map보다 큼
+        ms.list_events_delta.return_value = (
+            [
+                _ms_event(
+                    "o1",
+                    utc_start="2025-07-06T00:00:00.0000000",
+                    last_modified="2025-07-05T00:30:00Z",
+                )
+            ],
+            "https://delta.link2",
+        )
+        google.get_event.return_value = _google_event(
+            "g1",
+            utc_start="2025-07-03T00:00:00Z",
+            utc_end="2025-07-03T01:00:00Z",
+            updated="2025-07-05T01:00:00Z",
+        )
+        ms.update_event.return_value = _ms_event(
+            "o1",
+            utc_start="2025-07-03T00:00:00.0000000",
+            last_modified="2025-07-05T01:01:00Z",
+        )
+
+        engine.run()
+
+        ms.update_event.assert_called_once()
+        google.update_event.assert_not_called()
+        assert engine.stats.updated == 1
+
+    def test_both_outside_unchanged_no_update(self, tmp_path):
+        """양쪽 윈도우 밖이어도 map과 동일하면 업데이트 없음 (조회는 함)."""
+        engine, google, ms = _make_engine(tmp_path)
+        self._setup_mapped(engine)
+
+        google.list_events.return_value = []
+        ms.list_events_delta.return_value = ([], "https://delta.link2")
+        google.get_event.return_value = _google_event(
+            "g1", updated="2025-06-29T00:30:00Z"
+        )
+        ms.get_event.return_value = _ms_event(
+            "o1", last_modified="2025-06-29T00:30:00Z"
+        )
+
+        engine.run()
+
+        google.get_event.assert_called_once_with("g1")
+        ms.get_event.assert_called_once_with("o1")
         ms.update_event.assert_not_called()
         google.update_event.assert_not_called()
 
@@ -516,7 +656,7 @@ class TestOutOfWindowReconciliation:
 
         google.list_events.return_value = []
         ms.list_events_delta.return_value = (
-            [_ms_event("o1")],
+            [_ms_event("o1", last_modified="2025-06-29T00:30:00Z")],
             "https://delta.link2",
         )
         google.get_event.return_value = _google_event(
@@ -525,4 +665,18 @@ class TestOutOfWindowReconciliation:
 
         engine.run()
 
+        ms.update_event.assert_not_called()
+        google.update_event.assert_not_called()
+
+    def test_fractional_modified_equal_skips(self, tmp_path):
+        """소수초 표기만 다른 updated는 동일로 취급해 무한 루프 방지."""
+        engine, google, ms = _make_engine(tmp_path)
+        self._setup_mapped(engine)
+
+        google.list_events.return_value = [
+            _google_event("g1", updated="2025-06-29T00:30:00.000000Z")
+        ]
+        ms.list_events_delta.return_value = ([], "https://delta.link2")
+
+        engine.run()
         ms.update_event.assert_not_called()
